@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, Self, TextIO, TypeVar, cast
 from weakref import WeakKeyDictionary
 
-from pydantic import AliasChoices, AliasPath, ConfigDict
+from pydantic import AliasChoices, AliasPath, ConfigDict, ValidationError
 from pydantic._internal._config import config_keys
 from pydantic._internal._utils import is_model_class
 from pydantic.dataclasses import is_pydantic_dataclass
@@ -44,9 +44,12 @@ from .sources import (
 from .sources.base import _unwrap_optional_annotation
 from .sources.utils import (
     InitState,
+    _collect_sensitive_locs,
     _get_alias_names,
     _get_model_config,
+    _loc_is_sensitive,
     _resolve_setting,
+    _sensitive_value_leaks,
     _validate_by_alias_enabled,
     _validate_by_name_enabled,
     _warn_if_field_info_incomplete,
@@ -290,7 +293,15 @@ class BaseSettings(BaseModel):
             )
         )
 
-        super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+        _field_sources: dict[str, str] = {}
+        try:
+            super().__init__(
+                **__pydantic_self__.__class__._settings_build_values(
+                    sources, init_kwargs, field_sources=_field_sources
+                )
+            )
+        except ValidationError as error:
+            raise _sanitize_validation_error(error, __pydantic_self__.__class__, _field_sources) from None
 
     @classmethod
     def settings_cached(cls) -> Self:
@@ -523,7 +534,10 @@ class BaseSettings(BaseModel):
 
     @classmethod
     def _settings_build_values(
-        cls, sources: tuple[PydanticBaseSettingsSource, ...], init_kwargs: dict[str, Any]
+        cls,
+        sources: tuple[PydanticBaseSettingsSource, ...],
+        init_kwargs: dict[str, Any],
+        field_sources: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if sources:
             state: dict[str, Any] = {}
@@ -536,11 +550,46 @@ class BaseSettings(BaseModel):
                     source._set_settings_sources_data(states)
 
                 source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
-                source_state = source()
+                try:
+                    source_state = source()
+                except SettingsError:
+                    # Already redacted by the source layer (or an unrelated settings error): keep as-is.
+                    raise
+                except Exception as source_error:
+                    # Fallback for custom sources that raise directly from their own `__call__`,
+                    # bypassing the redaction in `PydanticBaseEnvSettingsSource.__call__`. The error
+                    # is rewritten only when it can be tied to a sensitive field, by name/alias or by
+                    # a sensitive value embedded in its message; unrelated errors propagate unchanged.
+                    sensitive_locs = _collect_sensitive_locs(cls)
+                    sensitive_loc = (
+                        _sensitive_value_leaks(
+                            str(source_error),
+                            cls,
+                            getattr(source, 'current_state', None),
+                            sensitive_locs,
+                        )
+                        if isinstance(source, PydanticBaseSettingsSource) and sensitive_locs
+                        else None
+                    )
+                    if sensitive_loc is None:
+                        raise
+                    raise SettingsError(
+                        f'error processing sensitive field "{".".join(str(part) for part in sensitive_loc)}" '
+                        f'from source "{source_name}" ({type(source_error).__name__}); '
+                        'the original value has been redacted',
+                        field_path=sensitive_loc,
+                        source=source_name,
+                        error_type=type(source_error).__name__,
+                        sensitive=True,
+                    ) from None
 
                 if isinstance(source, DefaultSettingsSource):
                     defaults = source_state
                     default_objects = source._default_objects
+                elif field_sources is not None and isinstance(source_state, dict):
+                    # Record which source supplied each field so sensitive-field errors can report
+                    # their origin. Higher-priority sources are processed first and win on collision.
+                    _register_source_paths(source_state, (), source_name, field_sources)
 
                 states[source_name] = source_state
                 state = deep_update(source_state, state)
@@ -758,6 +807,85 @@ def _is_unchanged(value: Any, default: Any) -> bool:
         return value is default or bool(value == default)
     except Exception:
         return False
+
+
+def _register_source_paths(
+    value: Any, prefix: tuple[str, ...], source_name: str, field_sources: dict[str, str]
+) -> None:
+    if not isinstance(value, dict):
+        return
+    for key, sub_value in value.items():
+        if not isinstance(key, str):
+            continue
+        path = (*prefix, key)
+        field_sources.setdefault('.'.join(path), source_name)
+        if isinstance(sub_value, dict):
+            _register_source_paths(sub_value, path, source_name, field_sources)
+
+
+def _error_source(loc: tuple[str | int, ...], field_sources: dict[str, str]) -> str | None:
+    """Find the source that supplied the value at an error location, matching its longest field path."""
+    string_parts = [part for part in loc if isinstance(part, str)]
+    for length in range(len(string_parts), 0, -1):
+        source = field_sources.get('.'.join(string_parts[:length]))
+        if source is not None:
+            return source
+    return None
+
+
+def _sanitize_line_error(details: dict[str, Any], loc: tuple[str | int, ...]) -> dict[str, Any]:
+    """Build a reconstruction-ready line error for a sensitive field, dropping value-bearing parts."""
+    line_error: dict[str, Any] = {'type': details['type'], 'loc': loc}
+    if details.get('url') is not None:
+        line_error['url'] = details['url']
+    error_type = details['type']
+    if error_type in ('value_error', 'assertion_error'):
+        # The original context wraps the validator's exception, whose message can embed the secret.
+        line_error['ctx'] = {'error': ValueError('the original value has been redacted')}
+    else:
+        # Other error types carry structural context (e.g. `min_length`), not the raw input value.
+        ctx = details.get('ctx')
+        if ctx:
+            line_error['ctx'] = {key: value for key, value in ctx.items() if not isinstance(value, (str, bytes))}
+    return line_error
+
+
+def _sanitize_validation_error(
+    error: ValidationError,
+    settings_cls: type[BaseSettings],
+    field_sources: dict[str, str],
+) -> ValidationError:
+    """Rebuild a pydantic `ValidationError`, redacting every error located on a sensitive field.
+
+    Non-sensitive errors are copied unchanged so their diagnostics stay identical. Sensitive errors
+    keep their type, location and documentation URL but lose the input value and any value-bearing
+    error context, since either can embed the raw credential. The source providing each redacted
+    value is attached via `error_sources`. The original exception is not chained to keep the secret
+    out of tracebacks.
+    """
+    sensitive_locs = _collect_sensitive_locs(settings_cls)
+    if not sensitive_locs:
+        return error
+
+    line_errors: list[dict[str, Any]] = []
+    redacted_locs: list[tuple[str | int, ...]] = []
+    for details in error.errors(include_url=False):
+        loc = tuple(details.get('loc', ()))
+        if not _loc_is_sensitive(loc, sensitive_locs):
+            line_errors.append({key: value for key, value in details.items() if key != 'url'})
+            continue
+        redacted_locs.append(loc)
+        line_errors.append(_sanitize_line_error(details, loc))
+
+    if not redacted_locs:
+        return error
+
+    sanitized = ValidationError.from_exception_data(
+        error.title or settings_cls.__name__, line_errors, hide_input=True
+    )
+    sanitized.error_sources = {loc: _error_source(loc, field_sources) for loc in redacted_locs}
+    sanitized.sensitive_locs = redacted_locs
+    return sanitized
 
 
 class CliApp:

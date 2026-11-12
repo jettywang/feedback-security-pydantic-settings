@@ -3524,6 +3524,96 @@ Secret file not found, skipping: /run/secrets/api_key
     from environment variables, dotenv files, or the secrets directory. Only enable it in a trusted
     debugging context, and avoid leaving it on in production.
 
+## Redacting sensitive field errors
+
+When a credential is wrong, the raw value must not end up in startup logs: pydantic normally echoes
+the failing input in a `ValidationError`, and a source may embed it in a decoding error. Fields that
+hold secrets are therefore redacted automatically, and any field can be opted in explicitly.
+
+A field is treated as **sensitive** when:
+
+* its annotation is a pydantic secret type — `SecretStr`, `SecretBytes`, or a parameterized
+  `Secret[...]` (including inside an optional or other union), or
+* it carries the `Sensitive` marker, which is useful for plain fields that still hold credentials:
+
+```python
+from typing import Annotated
+
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, Sensitive
+
+
+class Settings(BaseSettings):
+    token: SecretStr
+    password: Annotated[str, Sensitive()]
+```
+
+### Validation errors
+
+If pydantic rejects a value on a sensitive field, the raised `ValidationError` keeps the field's
+path, error type and documentation URL, but the input value and any value-bearing error context are
+removed. Errors on ordinary fields are left untouched, so their diagnostics stay exactly as pydantic
+produced them. The source that supplied each redacted value is attached as `error_sources`:
+
+```python
+import os
+
+from pydantic import ValidationError, field_validator
+
+# token is a SecretStr and therefore sensitive
+class Settings(BaseSettings):
+    token: SecretStr
+
+    @field_validator('token')
+    @classmethod
+    def check_token(cls, value):
+        raise ValueError(value.get_secret_value())
+
+
+os.environ['TOKEN'] = 'super-secret-value'
+try:
+    Settings()
+except ValidationError as exc:
+    print(exc.error_sources)
+    #> {('token',): 'EnvSettingsSource'}
+    # str(exc) and exc.errors() never contain 'super-secret-value'
+```
+
+### Source decoding errors
+
+When reading or decoding a sensitive field fails inside a settings source (for example invalid JSON),
+the original exception is replaced by a `SettingsError` that reports only the field path, the source
+name and the underlying error's type. It is not chained, so a message embedding the credential cannot
+leak through a traceback. The same data is available structurally from `error_details()`:
+
+```python
+import os
+from typing import Annotated
+
+from pydantic_settings import SettingsError
+
+
+class Settings(BaseSettings):
+    credentials: Annotated[dict, Sensitive()]
+
+
+os.environ['CREDENTIALS'] = '{broken-json'
+try:
+    Settings()
+except SettingsError as exc:
+    print(exc)
+    #> error processing sensitive field "credentials" from source "EnvSettingsSource"
+    #> (JSONDecodeError); the original value has been redacted
+    print(exc.error_details())
+    #> {'type': 'JSONDecodeError', 'loc': ['credentials'], 'source': 'EnvSettingsSource',
+    #>  'sensitive': True, 'message': '...'}
+```
+
+The exception type is unchanged for callers that catch it: source failures still raise
+`SettingsError`, and pydantic validation failures still raise `ValidationError`. Custom sources that
+implement their own `__call__` can redact a sensitive field failure with the
+`_redact_sensitive_field_error` helper instead of letting the underlying exception propagate.
+
 ## Customise settings sources
 
 If the default order of priority doesn't match your needs, it's possible to change it by overriding

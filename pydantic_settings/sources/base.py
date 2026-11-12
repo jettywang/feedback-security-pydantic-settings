@@ -32,6 +32,7 @@ from .types import (
 from .utils import (
     InitState,
     _annotation_is_complex,
+    _field_is_sensitive,
     _get_alias_names,
     _get_env_var_key,
     _get_field_annotation_and_metadata,
@@ -51,6 +52,24 @@ if TYPE_CHECKING:
     from pydantic_settings.main import BaseSettings
 
     from .types import Traversable
+
+
+def _sensitive_source_error(field_name: str, source_name: str, error: Exception) -> SettingsError:
+    """Build a `SettingsError` for a sensitive field without exposing its raw value.
+
+    Only the field path, the source name and the underlying error's type are reported. The original
+    exception is not chained (no ``from``) so its message, which may embed the secret, stays out of
+    tracebacks and centralized logs.
+    """
+    error_type = type(error).__name__
+    return SettingsError(
+        f'error processing sensitive field "{field_name}" from source "{source_name}" '
+        f'({error_type}); the original value has been redacted',
+        field_path=(field_name,),
+        source=source_name,
+        error_type=error_type,
+        sensitive=True,
+    )
 
 
 def get_subcommand(
@@ -217,6 +236,18 @@ class PydanticBaseSettingsSource(ABC):
     @abstractmethod
     def __call__(self) -> dict[str, Any]:
         pass
+
+    def _redact_sensitive_field_error(self, field_name: str, field: FieldInfo, error: Exception) -> SettingsError:
+        """Rewrite an error raised while reading or decoding a sensitive field.
+
+        The returned `SettingsError` carries only the field path, the source name and the original
+        error's type; the raw value is never embedded and the original exception is not chained.
+        Custom sources that implement their own `__call__` can use this to redact failures on
+        sensitive fields instead of letting the underlying exception propagate.
+        """
+        if not _field_is_sensitive(field):
+            raise error
+        return _sensitive_source_error(field_name, self.__class__.__name__, error)
 
 
 class ConfigFileSourceMixin(ABC):
@@ -718,18 +749,23 @@ class PydanticBaseEnvSettingsSource(PydanticBaseSettingsSource):
 
         for field_name, field in self.settings_cls.model_fields.items():
             _warn_if_field_info_incomplete(field, field_name, self._init_state)
+            source_name = self.__class__.__name__
             try:
                 field_value, field_key, value_is_complex = self._get_resolved_field_value(field, field_name)
             except Exception as e:
+                if _field_is_sensitive(field):
+                    raise self._redact_sensitive_field_error(field_name, field, e) from None
                 raise SettingsError(
-                    f'error getting value for field "{field_name}" from source "{self.__class__.__name__}"'
+                    f'error getting value for field "{field_name}" from source "{source_name}"'
                 ) from e
 
             try:
                 field_value = self.prepare_field_value(field_name, field, field_value, value_is_complex)
             except ValueError as e:
+                if _field_is_sensitive(field):
+                    raise self._redact_sensitive_field_error(field_name, field, e) from None
                 raise SettingsError(
-                    f'error parsing value for field "{field_name}" from source "{self.__class__.__name__}"'
+                    f'error parsing value for field "{field_name}" from source "{source_name}"'
                 ) from e
 
             if field_value is not None:

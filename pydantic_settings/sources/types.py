@@ -28,6 +28,17 @@ class ForceDecode:
     """Annotation to force decoding of a field value."""
 
 
+class Sensitive:
+    """Annotation marker flagging a settings field as sensitive.
+
+    When a field marked as sensitive fails while its value is read from a source or validated by
+    pydantic, the reported error keeps the field's path, source and error type but never includes the
+    original value. Fields annotated with a pydantic secret type (e.g. ``SecretStr``, ``SecretBytes``
+    or ``Secret[...]``) are treated as sensitive automatically; this marker is for plain fields that
+    also carry credentials, e.g. ``Annotated[str, Sensitive()]``.
+    """
+
+
 EnvPrefixTarget = Literal['variable', 'alias', 'all']
 DotenvType = Path | str | Sequence[Path | str]
 PathType = Path | str | Sequence[Path | str]
@@ -98,6 +109,7 @@ __all__ = [
     'PathType',
     'PydanticModel',
     'SecretVersion',
+    'Sensitive',
     '_CliDualFlag',
     '_CliExplicitFlag',
     '_CliImplicitFlag',

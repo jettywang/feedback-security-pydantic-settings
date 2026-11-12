@@ -23,7 +23,7 @@ from typing_inspection.introspection import is_union_origin
 
 from ..exceptions import IncompleteFieldDefinitionWarning, SettingsError
 from ..utils import _lenient_issubclass
-from .types import EnvNoneType
+from .types import EnvNoneType, Sensitive
 
 
 class InitState(TypedDict, total=False):
@@ -506,6 +506,164 @@ def _is_function(obj: Any) -> bool:
     return isinstance(obj, (FunctionType, BuiltinFunctionType))
 
 
+def _field_is_sensitive(field: FieldInfo) -> bool:
+    """Whether a field holds a sensitive value whose raw input must never appear in error output.
+
+    A field is sensitive when it carries the `Sensitive` marker in its `Annotated` metadata, or when
+    its annotation is a pydantic secret type (`SecretStr`, `SecretBytes`, or a parameterized
+    `Secret[...]`), including a secret inside an optional or other union.
+    """
+    if any(isinstance(metadata, Sensitive) for metadata in _get_field_metadata(field)):
+        return True
+    return _annotation_is_sensitive(field.annotation)
+
+
+def _annotation_is_sensitive(annotation: Any) -> bool:
+    """Whether an annotation contains a pydantic secret type, looking through `Annotated` and unions."""
+    from pydantic.types import _SecretBase
+
+    annotation = _resolve_type_alias(_strip_annotated(annotation))
+    if annotation is None:
+        return False
+    # A parameterized secret (e.g. `Secret[str]`) is a generic alias: check its origin too.
+    origin = get_origin(annotation)
+    if _lenient_issubclass(annotation, _SecretBase) or _lenient_issubclass(origin, _SecretBase):
+        return True
+    if is_union_origin(origin):
+        return any(_annotation_is_sensitive(arg) for arg in get_args(annotation))
+    return False
+
+
+def _collect_sensitive_locs(model_cls: type[Any]) -> set[tuple[str | int, ...]]:
+    """Collect the error locations (field paths) of every sensitive field on a settings model.
+
+    Nested models and dataclasses are walked recursively so that, e.g. a `SecretStr` nested under
+    `db.password` is redacted when pydantic reports the location `('db', 'password')`. Both field
+    names and validation aliases are included, since pydantic reports errors under the input name.
+    """
+    sensitive_locs: set[tuple[str | int, ...]] = set()
+    _collect_sensitive_locs_into(model_cls, (), sensitive_locs, set())
+    return sensitive_locs
+
+
+def _collect_sensitive_locs_into(
+    model_cls: type[Any],
+    prefix: tuple[str | int, ...],
+    sensitive_locs: set[tuple[str | int, ...]],
+    seen: set[int],
+) -> None:
+    if id(model_cls) in seen or not _is_model_or_dataclass(model_cls):
+        return
+    seen.add(id(model_cls))
+    validate_by_alias = _validate_by_alias_enabled(_get_model_config(model_cls))
+    for field_name, field_info in _get_model_fields(model_cls).items():
+        loc = (*prefix, field_name)
+        if _field_is_sensitive(field_info):
+            sensitive_locs.add(loc)
+            aliases, _ = _get_alias_names(field_name, field_info, validate_by_alias=validate_by_alias)
+            for alias in aliases:
+                sensitive_locs.add((*prefix, alias))
+        nested_annotation = _strip_annotated(field_info.annotation)
+        if is_union_origin(get_origin(nested_annotation)):
+            members = tuple(arg for arg in get_args(nested_annotation) if arg is not type(None))
+            nested_annotation = members[0] if len(members) == 1 else nested_annotation
+        nested_annotation = _strip_annotated(nested_annotation)
+        if _is_model_or_dataclass(nested_annotation):
+            _collect_sensitive_locs_into(nested_annotation, loc, sensitive_locs, seen)
+
+
+def _loc_is_sensitive(loc: tuple[str | int, ...], sensitive_locs: set[tuple[str | int, ...]]) -> bool:
+    """Whether an error location can reveal a sensitive value.
+
+    A location is sensitive when it is a sensitive field path, a path nested below one (e.g. an
+    indexed item of a sensitive container), or an ancestor of one: an error reported on the parent
+    model carries the whole input, including the sensitive child's value.
+    """
+    string_parts = tuple(part for part in loc if isinstance(part, str))
+    for sensitive_loc in sensitive_locs:
+        if loc[: len(sensitive_loc)] == sensitive_loc or string_parts[: len(sensitive_loc)] == sensitive_loc:
+            return True
+        # Ancestor match (e.g. loc `('db',)` for the nested path `('db', 'password')`): compare
+        # field-name segments only, since a list index in `loc` has no counterpart in the field path.
+        sensitive_strings = tuple(part for part in sensitive_loc if isinstance(part, str))
+        if sensitive_strings[: len(string_parts)] == string_parts:
+            return True
+    return False
+
+
+def _lookup_field_info(settings_cls: type[Any], loc: tuple[str | int, ...]) -> FieldInfo | None:
+    """Resolve the `FieldInfo` at a field path, walking through nested models and dataclasses."""
+    model_cls: Any = settings_cls
+    field_info: FieldInfo | None = None
+    for part in loc:
+        if not isinstance(part, str) or not _is_model_or_dataclass(model_cls):
+            return None
+        field_info = _get_model_fields(model_cls).get(part)
+        if field_info is None:
+            return None
+        nested = _strip_annotated(field_info.annotation)
+        if is_union_origin(get_origin(nested)):
+            members = tuple(arg for arg in get_args(nested) if arg is not type(None))
+            nested = members[0] if len(members) == 1 else nested
+        model_cls = _strip_annotated(nested)
+    return field_info
+
+
+def _state_value_at_path(state: Any, loc: tuple[str | int, ...]) -> Any:
+    """Read the value a source recorded under a field path, tolerating alias-keyed states."""
+    current = state
+    for part in loc:
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _iter_string_values(value: Any) -> Any:
+    """Yield every string contained in a value, descending into nested containers."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for sub_value in value.values():
+            yield from _iter_string_values(sub_value)
+    elif isinstance(value, (Sequence, AbstractSet)) and not isinstance(value, (bytes, bytearray)):
+        for sub_value in value:
+            yield from _iter_string_values(sub_value)
+
+
+def _sensitive_value_leaks(
+    message: str,
+    settings_cls: type[Any],
+    current_state: Any,
+    sensitive_locs: set[tuple[str | int, ...]],
+) -> tuple[str | int, ...] | None:
+    """Return a sensitive field path implicated in an error message.
+
+    A path matches when its field name or validation alias appears in the message, or when a value
+    recorded for it in the source state is embedded in the message. The name check covers sources
+    that fail before writing any state, while the value check catches messages built from the raw
+    credential. Only reasonably long values are treated as secrets to avoid coincidental matches.
+    """
+    lowered = message.lower()
+    for loc in sorted(sensitive_locs, key=len, reverse=True):
+        field_name = loc[-1]
+        if isinstance(field_name, str) and field_name.lower() in lowered:
+            return loc
+        field_info = _lookup_field_info(settings_cls, loc)
+        if field_info is not None:
+            aliases, _ = _get_alias_names(
+                field_name,
+                field_info,
+                validate_by_alias=_validate_by_alias_enabled(_get_model_config(settings_cls)),
+            )
+            if any(alias.lower() in lowered for alias in aliases):
+                return loc
+        for candidate in _iter_string_values(_state_value_at_path(current_state, loc)):
+            if len(candidate) >= 8 and candidate in message:
+                return loc
+    return None
+
 __all__ = [
     'InitState',
     '_annotation_contains_types',
@@ -513,18 +671,26 @@ __all__ = [
     '_annotation_enum_val_to_name',
     '_annotation_is_complex',
     '_annotation_is_complex_inner',
+    '_annotation_is_sensitive',
     '_as_list',
+    '_collect_sensitive_locs',
+    '_field_is_sensitive',
     '_get_alias_names',
     '_get_env_var_key',
     '_get_model_fields',
     '_get_union_members',
     '_is_function',
     '_is_model_or_dataclass',
+    '_iter_string_values',
     '_literal_has_numeric_enum',
+    '_loc_is_sensitive',
+    '_lookup_field_info',
     '_parse_env_none_str',
     '_resolve_config_file',
     '_resolve_setting',
     '_resolve_type_alias',
+    '_sensitive_value_leaks',
+    '_state_value_at_path',
     '_strip_annotated',
     '_union_has_strict_types',
     '_union_is_complex',
