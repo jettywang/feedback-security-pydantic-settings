@@ -3,13 +3,17 @@ from __future__ import annotations as _annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, AliasGenerator, AnyHttpUrl, Field
+import pytest
+from pydantic import AliasChoices, AliasGenerator, AnyHttpUrl, BaseModel, Field
 from pydantic.alias_generators import to_camel
 
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
+    SecretsSettingsSource,
     SettingsConfigDict,
+    SettingsError,
+    SourceNotAllowedWarning,
 )
 
 
@@ -180,3 +184,169 @@ def test_init_kwargs_override_env_with_alias_and_extra_forbid(env):
     #   Extra inputs are not permitted [type=extra_forbidden, input_value='dev', input_type=str]
     s = Settings(env_kind='hosted')
     assert s.env_kind == 'hosted'
+
+
+def test_allowed_sources_restricted_field_ignores_env_and_dotenv(tmp_path: Path, env):
+    env_file = tmp_path / '.env'
+    env_file.write_text('API_KEY=dotenv-api-key\nOTHER=from-dotenv\n')
+    secrets_dir = tmp_path / 'secrets'
+    secrets_dir.mkdir()
+    (secrets_dir / 'API_KEY').write_text('secrets-api-key\n')
+
+    class Settings(BaseSettings):
+        api_key: str
+        other: str = 'default'
+
+        model_config = SettingsConfigDict(env_file=env_file, secrets_dir=secrets_dir)
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'api_key': ('SecretsSettingsSource',)}
+
+    env.set('API_KEY', 'env-api-key')
+    with pytest.warns(SourceNotAllowedWarning) as record:
+        s = Settings()
+    # only the controlled secrets source may provide the credential
+    assert s.api_key == 'secrets-api-key'
+    # undeclared fields keep the default priority (dotenv over field default)
+    assert s.other == 'from-dotenv'
+    # both the env and the dotenv candidates were rejected
+    sources_in_warnings = {str(w.message).split('source ')[1].split("'")[1] for w in record}
+    assert sources_in_warnings == {'EnvSettingsSource', 'DotEnvSettingsSource'}
+
+
+def test_allowed_sources_warning_names_field_and_source_but_not_value(env):
+    class Settings(BaseSettings):
+        api_key: str = 'default-key'
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'api_key': ('SecretsSettingsSource',)}
+
+    env.set('API_KEY', 'super-secret-env-value')
+    with pytest.warns(SourceNotAllowedWarning) as record:
+        s = Settings()
+    assert s.api_key == 'default-key'
+    messages = [str(w.message) for w in record]
+    assert any('api_key' in m and 'EnvSettingsSource' in m for m in messages)
+    assert all('super-secret-env-value' not in m for m in messages)
+
+
+def test_allowed_sources_alias_cannot_bypass_restriction(env):
+    class Settings(BaseSettings):
+        api_key: str = Field('default-key', validation_alias=AliasChoices('MY_API_KEY', 'API_KEY'))
+        model_config = SettingsConfigDict(populate_by_name=True)
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'api_key': ('InitSettingsSource',)}
+
+    # a disallowed source must not take effect under any of the field's names
+    env.set('MY_API_KEY', 'env-alias-value')
+    env.set('API_KEY', 'env-other-alias-value')
+    with pytest.warns(SourceNotAllowedWarning):
+        s = Settings()
+    assert s.api_key == 'default-key'
+
+    # the allowed source can use any of the field's names
+    env.pop('MY_API_KEY')
+    env.pop('API_KEY')
+    assert Settings(api_key='init-value').api_key == 'init-value'
+    assert Settings(MY_API_KEY='init-alias-value').api_key == 'init-alias-value'
+
+
+def test_allowed_sources_init_kwarg_dropped_when_not_allowed(env):
+    class Settings(BaseSettings):
+        token: str = 'default'
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'token': ('EnvSettingsSource',)}
+
+    env.set('TOKEN', 'from-env')
+    with pytest.warns(SourceNotAllowedWarning):
+        s = Settings(token='from-init')
+    assert s.token == 'from-env'
+
+
+def test_allowed_sources_nested_leaf_dict_merge(tmp_path: Path):
+    env_file = tmp_path / '.env'
+    env_file.write_text('DB={"host": "db.local", "password": "dotenv-password"}\n')
+    secrets_dir = tmp_path / 'secrets'
+    secrets_dir.mkdir()
+    (secrets_dir / 'DB').write_text('{"password": "secrets-password"}')
+
+    class Db(BaseModel):
+        host: str = 'localhost'
+        password: str = 'unset'
+
+    class Settings(BaseSettings):
+        db: Db
+
+        model_config = SettingsConfigDict(env_file=env_file, secrets_dir=secrets_dir)
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            # source classes are accepted as well as names
+            return {'db.password': (SecretsSettingsSource,)}
+
+    with pytest.warns(SourceNotAllowedWarning) as record:
+        s = Settings()
+    # the disallowed leaf is stripped before merging, the sibling leaf still merges
+    assert s.db.host == 'db.local'
+    assert s.db.password == 'secrets-password'
+    assert all('dotenv-password' not in str(w.message) for w in record)
+
+
+def test_allowed_sources_nested_leaf_from_env_delimiter(env):
+    class Db(BaseModel):
+        host: str = 'localhost'
+        password: str = 'unset'
+
+    class Settings(BaseSettings):
+        db: Db = Db()
+
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'db.password': ('SecretsSettingsSource',)}
+
+    env.set('DB__HOST', 'env-host')
+    env.set('DB__PASSWORD', 'env-password')
+    with pytest.warns(SourceNotAllowedWarning) as record:
+        s = Settings()
+    assert s.db.host == 'env-host'
+    assert s.db.password == 'unset'
+    assert all('env-password' not in str(w.message) for w in record)
+
+
+def test_allowed_sources_nested_leaf_alias_cannot_bypass(env):
+    class Db(BaseModel):
+        password: str = Field('unset', validation_alias='DB_PASS')
+
+    class Settings(BaseSettings):
+        db: Db = Field(default_factory=Db)
+
+        model_config = SettingsConfigDict(env_nested_delimiter='__')
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'db.password': ('SecretsSettingsSource',)}
+
+    env.set('DB__DB_PASS', 'env-password')
+    with pytest.warns(SourceNotAllowedWarning):
+        s = Settings()
+    assert s.db.password == 'unset'
+
+
+def test_allowed_sources_unknown_field_raises():
+    class Settings(BaseSettings):
+        foo: str = 'x'
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            return {'typo_field': ('EnvSettingsSource',)}
+
+    with pytest.raises(SettingsError, match='unknown field'):
+        Settings()

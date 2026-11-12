@@ -3483,6 +3483,70 @@ the selected value is determined as follows (in descending order of priority):
 5. Variables loaded from the secrets directory.
 6. The default field values for the `Settings` model.
 
+## Restricting sources per field
+
+Sometimes a few sensitive fields should only ever come from a controlled source — for example,
+general configuration lives in a `.env` file, but credentials must come from the secrets
+directory. Override `settings_allowed_sources` to declare which sources may provide a field's
+value:
+
+```py
+import os
+import tempfile
+import warnings
+
+from pydantic_settings import BaseSettings, SettingsConfigDict, SourceNotAllowedWarning
+
+with tempfile.TemporaryDirectory() as secrets_dir:
+    with open(f'{secrets_dir}/api_key', 'w') as f:
+        f.write('secret-from-controlled-store')
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(secrets_dir=secrets_dir)
+
+        api_key: str
+        debug: bool = False
+
+        @classmethod
+        def settings_allowed_sources(cls):
+            # `api_key` is only accepted from the secrets directory
+            return {'api_key': ('SecretsSettingsSource',)}
+
+    os.environ['API_KEY'] = 'uncontrolled-env-value'
+    os.environ['DEBUG'] = 'true'
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', SourceNotAllowedWarning)
+        settings = Settings()
+
+    print(settings.model_dump())
+    #> {'api_key': 'secret-from-controlled-store', 'debug': True}
+    print(caught[0].message)
+    #> Value for field 'api_key' from source 'EnvSettingsSource' was ignored: the field only accepts values from source(s): SecretsSettingsSource
+```
+
+The mapping keys name fields by their **field names**, using `.` to reach leaf fields of nested
+models (e.g. `'database.password'`). The mapping values are the allowed sources, given as source
+classes (matched with `isinstance`, so subclasses are allowed too) or as source names (strings
+matched against the source's class name, like `'SecretsSettingsSource'` in the example above).
+
+The semantics are:
+
+* Fields not listed in the mapping are resolved with the default source priority, unchanged.
+* A declared field is protected under every name it can be populated from — its field name, its
+  `alias`/`validation_alias` choices, and alias path heads — so a value from a disallowed source
+  cannot take effect by using another name.
+* Disallowed values are dropped before the sources are merged, so they cannot take effect by
+  deep-merging into a nested dictionary either: sibling keys from the same source still merge,
+  only the restricted leaves are removed.
+* The check applies to every source in the pipeline, including init kwargs and CLI arguments.
+  Field defaults declared on the model itself are not affected, as they are applied by pydantic
+  rather than by a settings source.
+* Each dropped value emits a `SourceNotAllowedWarning` naming only the field and the source —
+  the dropped value is never included in the diagnostic.
+* Declaring a path that does not resolve to a field of the settings model (or of a nested model
+  along the path) raises a `SettingsError`, so a typo cannot silently disable the protection.
+
 ## Debugging settings sources
 
 When several sources are enabled, it can be hard to tell which source a given value came from — and

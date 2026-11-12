@@ -18,7 +18,7 @@ from pydantic.dataclasses import is_pydantic_dataclass
 from pydantic.fields import FieldInfo
 from pydantic.main import BaseModel
 
-from .exceptions import SettingsError
+from .exceptions import SettingsError, SourceNotAllowedWarning
 from .sources import (
     ENV_FILE_SENTINEL,
     CliSettingsSource,
@@ -46,7 +46,10 @@ from .sources.utils import (
     InitState,
     _get_alias_names,
     _get_model_config,
+    _get_model_fields,
+    _is_model_or_dataclass,
     _resolve_setting,
+    _strip_annotated,
     _validate_by_alias_enabled,
     _validate_by_name_enabled,
     _warn_if_field_info_incomplete,
@@ -358,6 +361,44 @@ class BaseSettings(BaseModel):
         return init_settings, env_settings, dotenv_settings, file_secret_settings
 
     @classmethod
+    def settings_allowed_sources(cls) -> Mapping[str, tuple[type[PydanticBaseSettingsSource] | str, ...]]:
+        """
+        Declare which settings sources may provide values for specific fields.
+
+        Fields not listed here are resolved with the default source priority, unchanged.
+
+        Returns:
+            A mapping of dotted field paths to the sources allowed to provide their values:
+
+            - Keys name fields by their **field names**, using `.` to reach leaf fields of nested
+              models (e.g. `'api_key'`, `'database.password'`). Aliases are not needed here: a
+              declared field is protected under every name it can be populated from (its field
+              name, `alias`/`validation_alias` choices, and alias path heads), so a value from a
+              disallowed source cannot take effect by using another name.
+            - Values are the allowed sources, given as source classes (matched with `isinstance`,
+              so subclasses of an allowed source are allowed too) or as source names (strings
+              matched against the source's class name, e.g. `'SecretsSettingsSource'`).
+
+        A value offered by a disallowed source is dropped before the sources are merged, so it
+        cannot take effect directly or by deep-merging into a nested dictionary, and a
+        `SourceNotAllowedWarning` is emitted naming only the field and the source — never the
+        dropped value. The check applies to every source in the pipeline, including init kwargs
+        and CLI arguments. Field defaults declared on the model itself are not affected, as they
+        are applied by pydantic rather than by a settings source.
+        """
+        return {}
+
+    @classmethod
+    def _settings_allowed_sources_tree(cls) -> dict[str, Any]:
+        """Build and validate the restriction tree declared by `settings_allowed_sources`."""
+        mapping = cls.settings_allowed_sources()
+        if not mapping:
+            return {}
+        tree = _build_allowed_sources_tree(mapping)
+        _validate_allowed_sources_tree(cls, tree)
+        return tree
+
+    @classmethod
     def _settings_init_sources(
         cls,
         _case_sensitive: bool | None = None,
@@ -526,6 +567,7 @@ class BaseSettings(BaseModel):
         cls, sources: tuple[PydanticBaseSettingsSource, ...], init_kwargs: dict[str, Any]
     ) -> dict[str, Any]:
         if sources:
+            allowed_sources_tree = cls._settings_allowed_sources_tree()
             state: dict[str, Any] = {}
             defaults: dict[str, Any] = {}
             default_objects: dict[str, Any] = {}
@@ -537,6 +579,9 @@ class BaseSettings(BaseModel):
 
                 source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
                 source_state = source()
+
+                if allowed_sources_tree:
+                    _filter_disallowed_source_values(cls, source_state, allowed_sources_tree, source, source_name)
 
                 if isinstance(source, DefaultSettingsSource):
                     defaults = source_state
@@ -718,6 +763,155 @@ class BaseSettings(BaseModel):
         ),
         enable_decoding=True,
     )
+
+
+def _build_allowed_sources_tree(mapping: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Build a nested tree from the dotted field paths declared by `settings_allowed_sources`.
+
+    Each node is `{'allowed': tuple of allowed sources or None, 'children': {name: child node}}`.
+    """
+    tree: dict[str, dict[str, Any]] = {}
+    for path, allowed in mapping.items():
+        if isinstance(allowed, (str, type)):
+            allowed = (allowed,)
+        segments = path.split('.')
+        if any(not segment for segment in segments):
+            raise SettingsError(f'settings_allowed_sources: invalid field path {path!r}')
+        node = tree
+        for segment in segments[:-1]:
+            node = node.setdefault(segment, {'allowed': None, 'children': {}})['children']
+        node.setdefault(segments[-1], {'allowed': None, 'children': {}})['allowed'] = tuple(allowed)
+    return tree
+
+
+def _validate_allowed_sources_tree(model_cls: type[Any] | None, tree: dict[str, dict[str, Any]]) -> None:
+    """Check that every declared path resolves to a field, so a typo cannot silently disable protection.
+
+    Paths below a field that is not a model or dataclass (e.g. a plain `dict`) cannot be validated
+    and are accepted as-is.
+    """
+    if model_cls is None or not _is_model_or_dataclass(model_cls):
+        return
+    model_fields = _get_model_fields(model_cls)
+    for name, node in tree.items():
+        field_info = model_fields.get(name)
+        if field_info is None:
+            raise SettingsError(
+                f'settings_allowed_sources: unknown field {name!r} on model {model_cls.__name__!r}'
+            )
+        if node['children']:
+            _validate_allowed_sources_tree(_nested_model_cls(field_info), node['children'])
+
+
+def _nested_model_cls(field_info: FieldInfo) -> type[Any] | None:
+    """The model or dataclass a field is annotated with, or `None` for other annotations."""
+    annotation = field_info.annotation
+    if annotation is None:
+        return None
+    annotation = _strip_annotated(_unwrap_optional_annotation(annotation))
+    return annotation if _is_model_or_dataclass(annotation) else None
+
+
+def _field_candidate_keys(field_name: str, field_info: FieldInfo, validate_by_alias: bool) -> set[str]:
+    """Every key a field can be populated from: its name, aliases, and alias path heads."""
+    keys = {field_name}
+    if validate_by_alias:
+        alias = field_info.validation_alias if field_info.validation_alias is not None else field_info.alias
+        if isinstance(alias, str):
+            keys.add(alias)
+        elif isinstance(alias, AliasChoices):
+            for choice in alias.choices:
+                keys.add(choice if isinstance(choice, str) else cast(str, choice.path[0]))
+        elif isinstance(alias, AliasPath):
+            keys.add(cast(str, alias.path[0]))
+    return keys
+
+
+def _source_is_allowed(source: object, source_name: str, allowed: tuple[type[Any] | str, ...]) -> bool:
+    """Whether a source may provide a restricted field's value.
+
+    Class entries match with `isinstance` (subclasses of an allowed source are allowed too);
+    string entries match the source's name exactly.
+    """
+    for entry in allowed:
+        if isinstance(entry, type):
+            if isinstance(source, entry):
+                return True
+        elif entry == source_name:
+            return True
+    return False
+
+
+def _warn_disallowed_source(field_path: str, source_name: str, allowed: tuple[type[Any] | str, ...]) -> None:
+    """Report a dropped value, naming only the field and the source — never the value."""
+    allowed_names = ', '.join(entry.__name__ if isinstance(entry, type) else entry for entry in allowed)
+    # No `stacklevel`: sources are called at differing depths, so no fixed value attributes
+    # the warning to user code.
+    warnings.warn(  # noqa: B028
+        f'Value for field {field_path!r} from source {source_name!r} was ignored: '
+        f'the field only accepts values from source(s): {allowed_names}',
+        SourceNotAllowedWarning,
+    )
+
+
+def _filter_disallowed_source_values(
+    model_cls: type[Any] | None,
+    state: dict[str, Any],
+    tree: dict[str, dict[str, Any]],
+    source: object,
+    source_name: str,
+    path: tuple[str, ...] = (),
+    warned: set[str] | None = None,
+) -> None:
+    """Drop, in place, the values a source provides for fields it is not allowed to populate.
+
+    Restricted fields are matched under every key they can be populated from, and nested
+    dictionaries are filtered recursively, so a disallowed value cannot survive under another
+    name or by deep-merging into a nested model. `model_cls` is `None` below fields that are
+    plain mappings, where declared path segments are matched as literal keys.
+    """
+    if warned is None:
+        warned = set()
+    if model_cls is not None and _is_model_or_dataclass(model_cls):
+        validate_by_alias = _validate_by_alias_enabled(_get_model_config(model_cls))
+        for field_name, field_info in _get_model_fields(model_cls).items():
+            node = tree.get(field_name)
+            if node is None:
+                continue
+            for key in _field_candidate_keys(field_name, field_info, validate_by_alias):
+                if key not in state:
+                    continue
+                if node['allowed'] is not None and not _source_is_allowed(source, source_name, node['allowed']):
+                    del state[key]
+                    field_path = '.'.join((*path, field_name))
+                    if field_path not in warned:
+                        warned.add(field_path)
+                        _warn_disallowed_source(field_path, source_name, node['allowed'])
+                    continue
+                if node['children'] and isinstance(state[key], dict):
+                    _filter_disallowed_source_values(
+                        _nested_model_cls(field_info),
+                        state[key],
+                        node['children'],
+                        source,
+                        source_name,
+                        (*path, field_name),
+                        warned,
+                    )
+    else:
+        for name, node in tree.items():
+            if name not in state:
+                continue
+            if node['allowed'] is not None and not _source_is_allowed(source, source_name, node['allowed']):
+                del state[name]
+                field_path = '.'.join((*path, name))
+                if field_path not in warned:
+                    warned.add(field_path)
+                    _warn_disallowed_source(field_path, source_name, node['allowed'])
+            elif node['children'] and isinstance(state[name], dict):
+                _filter_disallowed_source_values(
+                    None, state[name], node['children'], source, source_name, (*path, name), warned
+                )
 
 
 def _strip_unset_defaults(value: Any, default: Any, default_obj: BaseModel) -> Any:
