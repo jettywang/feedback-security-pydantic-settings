@@ -8,6 +8,7 @@ from ...exceptions import SettingsError
 from ...utils import path_type_label
 from ..base import PydanticBaseSettingsSource
 from ..utils import InitState, _as_list
+from ._secrets_utils import load_secret_file
 from .env import EnvSettingsSource
 from .secrets import SecretsSettingsSource
 
@@ -210,9 +211,16 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
 
     @classmethod
     def load_secrets(cls, path: Path) -> dict[str, str]:
-        # Explicit encoding, matching SecretsSettingsSource: the locale default would
-        # corrupt UTF-8 secrets on a non-UTF-8 Windows code page.
-        return {str(p.relative_to(path)): p.read_text(encoding='utf-8').strip() for p in cls._iter_secret_files(path)}
+        # The walk that decides which paths are candidates (including symlink safety)
+        # stays here, but the read uses the same helper as SecretsSettingsSource:
+        # explicit UTF-8 encoding and a warning instead of a crash when a file
+        # cannot be read.
+        secrets: dict[str, str] = {}
+        for secret_path in cls._iter_secret_files(path):
+            value = load_secret_file(secret_path)
+            if value is not None:
+                secrets[str(secret_path.relative_to(path))] = value
+        return secrets
 
     def __repr__(self) -> str:
         return f'NestedSecretsSettingsSource(secrets_dir={self.secrets_dir!r})'

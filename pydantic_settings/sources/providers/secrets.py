@@ -17,6 +17,7 @@ from ...exceptions import SettingsError
 from ..base import PydanticBaseEnvSettingsSource
 from ..types import EnvPrefixTarget, PathType
 from ..utils import InitState, _as_list, _resolve_setting
+from ._secrets_utils import load_secret_file, secret_file_type_warning
 
 if TYPE_CHECKING:
     from pydantic_settings.main import BaseSettings
@@ -128,12 +129,16 @@ class SecretsSettingsSource(PydanticBaseEnvSettingsSource):
                 if path.is_file():
                     if debug:
                         logger.debug('Loading secret file: %s', path.resolve())
-                    # Explicit encoding: `read_text()` would otherwise decode with the
-                    # locale encoding, so a UTF-8 secret is corrupted on a non-UTF-8
-                    # Windows code page (silently, when every byte happens to map).
-                    return path.read_text(encoding='utf-8').strip(), field_key, value_is_complex
+                    # Candidate resolution (``find_case_path``) stays source-specific;
+                    # the type check and the read itself go through the shared helper so
+                    # both file-based secrets sources handle non-file and unreadable
+                    # entries identically.
+                    value = load_secret_file(path)
+                    if value is not None:
+                        return value, field_key, value_is_complex
+                    continue
                 warnings.warn(
-                    f'attempted to load secret file "{path}" but found a {path_type_label(path)} instead.',
+                    secret_file_type_warning(path),
                     stacklevel=4,
                 )
 
