@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 SECRETS_DIR_MAX_SIZE = 16 * 2**20  # 16 MiB seems to be a reasonable default
 SECRETS_DIR_MAX_ENTRIES = 10_000  # bounds the walk through repeated directory links
+# A versioned directory is re-read at most this often when an atomic symlink switch lands
+# in the middle of a load; beyond it the load fails instead of mixing versions.
+SECRETS_DIR_MAX_LOAD_ATTEMPTS = 5
 
 
 class NestedSecretsSettingsSource(EnvSettingsSource):
@@ -97,7 +100,12 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
 
         # ensure valid secrets_path
         paths = [] if self.secrets_dir is None else _as_list(self.secrets_dir)
-        self.secrets_paths: list[Path] = [Path(p).expanduser().resolve() for p in paths]
+        # Keep the un-resolved (but user-expanded) entries so a symlinked directory that is
+        # switched atomically between versions (e.g. a Kubernetes-style ``current -> v1``
+        # mount) is re-resolved on every load attempt; ``secrets_paths`` holds the resolved
+        # entries used for validation and size accounting.
+        self.secrets_dir_paths: list[Path] = [Path(p).expanduser() for p in paths]
+        self.secrets_paths: list[Path] = [p.resolve() for p in self.secrets_dir_paths]
         for path in self.secrets_paths:
             self.validate_secrets_path(path)
 
@@ -126,7 +134,7 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
         # raw filenames first would keep the earlier key's insertion position, so a later
         # ``TOKEN`` could not displace an earlier ``token`` once names are case-folded.
         secrets: dict[str, str | None] = {}
-        for path in self.secrets_paths:
+        for path in self.secrets_dir_paths:
             secrets.update(self._parse_env_vars(self.load_secrets(path)))
         return secrets
 
@@ -208,11 +216,94 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
 
         yield from walk(path, frozenset({path}))
 
+    @staticmethod
+    def _entry_identity(path: Path) -> tuple[int, int, int, int]:
+        # Device/inode identify the file object; size and mtime catch an in-place truncation
+        # or rewrite that reuses the same inode but changes the payload.
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
     @classmethod
-    def load_secrets(cls, path: Path) -> dict[str, str]:
+    def _directory_generation(cls, path: Path) -> tuple[object, ...]:
+        """Identity snapshot of the on-disk version currently visible at ``path``.
+
+        The snapshot pairs the entry's own device/inode with the identity of every secret
+        file beneath its resolved target, keyed by the file's path relative to that target.
+        Each file identity includes size and modification time in addition to device and
+        inode. It therefore identifies a concrete on-disk version rather than a pathname,
+        and detects both kinds of atomic delivery:
+
+        * a symlink repoint (``current -> v1`` becomes ``current -> v2``) changes the stat
+          identity of the entry passed in, even when the old target directory is kept;
+        * an in-place swap (the resolved directory's files are replaced, truncated, or
+          rewritten) keeps the entry itself but changes at least one file's identity.
+
+        The walk is the same one used to read the files, so the two see the same entries,
+        including the handling of symlinks. ``OSError`` means the directory vanished or was
+        switched under us; an empty, stateless snapshot then never matches a real directory
+        and simply forces another attempt.
+        """
+        try:
+            entry = (str(path), path.stat()[:2])
+            resolved = path.resolve()
+            files = tuple(
+                sorted(
+                    (p.relative_to(resolved), cls._entry_identity(p))
+                    for p in cls._iter_secret_files(resolved)
+                )
+            )
+        except OSError:
+            return ()
+        return (entry, files)
+
+    @classmethod
+    def _read_secret_files(cls, path: Path) -> dict[str, str]:
         # Explicit encoding, matching SecretsSettingsSource: the locale default would
         # corrupt UTF-8 secrets on a non-UTF-8 Windows code page.
-        return {str(p.relative_to(path)): p.read_text(encoding='utf-8').strip() for p in cls._iter_secret_files(path)}
+        return {
+            str(p.relative_to(path)): p.read_text(encoding='utf-8').strip()
+            for p in cls._iter_secret_files(path)
+        }
+
+    @classmethod
+    def load_secrets(cls, path: Path) -> dict[str, str]:
+        """Load every secret under ``path`` from a single on-disk version.
+
+        Ops may deliver paired secret files (e.g. a key id and its key value) by pointing
+        the configured directory at versioned payloads and atomically switching the
+        symlink (``current -> v1`` becomes ``current -> v2``). A naive walk that crosses
+        such a switch returns some files from each version, combining key id and value that
+        were never deployed together.
+
+        The load therefore takes a generation snapshot before reading and another one
+        afterwards; any difference, or a directory that disappears mid-read, restarts the
+        whole load against the now-current version. Re-resolution happens on every attempt,
+        so a switched symlink is followed to its new target. Only after an unchanged
+        snapshot brackets the reads is the result returned, guaranteeing it is a complete
+        old or new version. A directory that is missing at load time yields no secrets, as
+        before; ``secrets_dir_missing`` still governs the earlier existence check.
+        """
+        if not path.exists():
+            return {}
+        for _ in range(SECRETS_DIR_MAX_LOAD_ATTEMPTS):
+            # The generation snapshot is taken on the entry itself, so a repointed symlink
+            # changes the snapshot even when the previous target directory stays on disk.
+            # The same entry object is re-statted after the reads: resolving it again would
+            # produce a fresh path object (e.g. through a ``/tmp -> /private/tmp`` link) and
+            # make otherwise identical snapshots compare unequal.
+            generation = cls._directory_generation(path)
+            try:
+                secrets = cls._read_secret_files(path.resolve())
+            except OSError:
+                # The current version was removed or switched while the files were open;
+                # re-resolve and try again rather than returning a partial payload.
+                continue
+            if cls._directory_generation(path) == generation:
+                return secrets
+        raise SettingsError(
+            f'secrets directory "{path}" kept changing while loading; '
+            f'could not read a consistent version after {SECRETS_DIR_MAX_LOAD_ATTEMPTS} attempts'
+        )
 
     def __repr__(self) -> str:
         return f'NestedSecretsSettingsSource(secrets_dir={self.secrets_dir!r})'

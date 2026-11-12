@@ -2687,6 +2687,16 @@ links is loaded under each of its names. Hidden entries (names starting with `.`
 with a `SettingsError` after `SECRETS_DIR_MAX_ENTRIES` (10,000) entries, so a tree of repeated links cannot make
 loading hang.
 
+A `secrets_dir` may be a symlink that an operator repoints atomically between versioned payloads
+(`current -> v1` becomes `current -> v2`, as a Kubernetes secret volume or a `ln -sfn` deployment does). Each
+directory is loaded as one consistent version: an identity snapshot is taken before the files are read and again
+afterwards, so a switch landing in the middle of a load is detected and the whole directory is re-read against the
+now-current version. Paired secret files (for example a key id and its key value) therefore never come from two
+different versions of a single `Settings` construction; the result is always a complete old or new version. If the
+directory keeps changing on every attempt, loading fails with a `SettingsError` after `SECRETS_DIR_MAX_LOAD_ATTEMPTS`
+(5) attempts rather than returning a mixed payload. The last-directory-wins order and the `secrets_dir_missing`
+options are unchanged.
+
 #### secrets_case_sensitive
 
 Same as `case_sensitive`, but works for secrets only. If not specified, defaults to `case_sensitive`.

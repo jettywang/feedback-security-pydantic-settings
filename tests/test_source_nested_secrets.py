@@ -15,7 +15,7 @@ from pydantic_settings import (
 )
 from pydantic_settings.sources.providers import env as env_provider
 from pydantic_settings.sources.providers import nested_secrets
-from pydantic_settings.sources.providers.nested_secrets import SECRETS_DIR_MAX_SIZE
+from pydantic_settings.sources.providers.nested_secrets import SECRETS_DIR_MAX_LOAD_ATTEMPTS, SECRETS_DIR_MAX_SIZE
 
 
 class DbSettings(BaseModel):
@@ -853,3 +853,202 @@ def test_load_secrets_utf8_under_non_utf8_locale(tmp_path, non_utf8_default_enco
     (tmp_path / 'token').write_bytes('café-pässwörd'.encode())
 
     assert NestedSecretsSettingsSource.load_secrets(tmp_path) == {'token': 'café-pässwörd'}
+
+
+def _write_version(directory: Path, version: str) -> None:
+    """A paired key id / key value deployment, both carrying the same version tag."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'key_id').write_text(f'id-{version}')
+    (directory / 'key_value').write_text(f'value-{version}')
+
+
+def _point_current(current: Path, target: Path) -> None:
+    if current.is_symlink() or current.exists():
+        current.unlink()
+    current.symlink_to(target, target_is_directory=True)
+
+
+class _VersionedSettings(BaseSettings):
+    key_id: str
+    key_value: str
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings
+    ):
+        return (NestedSecretsSettingsSource(file_secret_settings),)
+
+
+def test_load_secrets_reads_one_consistent_version_across_symlink_switch(tmp_path):
+    """A switch landing between two file reads must not combine the old key id with the new value.
+
+    The configured directory is a ``current`` symlink repointed from ``v1`` to ``v2``. The
+    switch is triggered from inside the first file read, a controllable point inside the
+    single ``Settings()`` construction. The loader must restart and return the complete new
+    version rather than a mixed pair.
+    """
+    v1, v2 = tmp_path / 'v1', tmp_path / 'v2'
+    _write_version(v1, 'v1')
+    _write_version(v2, 'v2')
+    current = tmp_path / 'current'
+    _point_current(current, v1)
+
+    class Settings(_VersionedSettings):
+        model_config = SettingsConfigDict(secrets_dir=current)
+
+    assert Settings().model_dump() == {'key_id': 'id-v1', 'key_value': 'value-v1'}
+
+    real_read_text = Path.read_text
+    switched = False
+
+    def switching_read_text(self, encoding=None, *args, **kwargs):
+        nonlocal switched
+        result = real_read_text(self, encoding=encoding, *args, **kwargs)
+        if not switched and self.name == 'key_id':
+            _point_current(current, v2)
+            switched = True
+        return result
+
+    with patch.object(Path, 'read_text', switching_read_text):
+        settings = Settings()
+
+    assert switched
+    assert settings.model_dump() == {'key_id': 'id-v2', 'key_value': 'value-v2'}
+
+
+def test_load_secrets_retries_when_old_version_is_removed(tmp_path):
+    """The active version can disappear mid-load; the vanished files force a re-read.
+
+    After the switch the ``v1`` directory is removed, so reading the second file of the
+    first attempt fails with ``OSError`` instead of merely looking stale. The loader must
+    follow the repointed symlink and still converge on the complete ``v2`` payload.
+    """
+    import shutil
+
+    v1, v2 = tmp_path / 'v1', tmp_path / 'v2'
+    _write_version(v1, 'v1')
+    _write_version(v2, 'v2')
+    current = tmp_path / 'current'
+    _point_current(current, v1)
+
+    class Settings(_VersionedSettings):
+        model_config = SettingsConfigDict(secrets_dir=current)
+
+    real_read_text = Path.read_text
+    switched = False
+
+    def switching_and_deleting_read_text(self, encoding=None, *args, **kwargs):
+        nonlocal switched
+        result = real_read_text(self, encoding=encoding, *args, **kwargs)
+        if not switched and self.name == 'key_id':
+            _point_current(current, v2)
+            shutil.rmtree(v1)
+            switched = True
+        return result
+
+    with patch.object(Path, 'read_text', switching_and_deleting_read_text):
+        settings = Settings()
+
+    assert switched
+    assert settings.model_dump() == {'key_id': 'id-v2', 'key_value': 'value-v2'}
+
+
+def test_load_secrets_detects_in_place_version_replacement(tmp_path):
+    """A version swap without a symlink (files replaced in place) is caught via inode change.
+
+    The post-read generation snapshot differs from the pre-read one, so even though the
+    pathnames are unchanged the loader retries and returns the fully replaced version.
+    """
+    secrets_dir = tmp_path / 'secrets'
+    _write_version(secrets_dir, 'v1')
+
+    class Settings(_VersionedSettings):
+        model_config = SettingsConfigDict(secrets_dir=secrets_dir)
+
+    real_read_text = Path.read_text
+    replaced = False
+
+    def replacing_read_text(self, encoding=None, *args, **kwargs):
+        nonlocal replaced
+        result = real_read_text(self, encoding=encoding, *args, **kwargs)
+        if not replaced and self.name == 'key_id':
+            # Replace the files rather than truncating them in place, mirroring an atomic
+            # payload swap: a brand-new inode is created for each secret.
+            for name in ('key_id', 'key_value'):
+                (secrets_dir / name).unlink()
+            _write_version(secrets_dir, 'v2')
+            replaced = True
+        return result
+
+    with patch.object(Path, 'read_text', replacing_read_text):
+        settings = Settings()
+
+    assert replaced
+    assert settings.model_dump() == {'key_id': 'id-v2', 'key_value': 'value-v2'}
+
+
+def test_load_secrets_raises_after_bounded_attempts(tmp_path, monkeypatch):
+    """A directory that changes on every attempt must fail instead of mixing versions."""
+    secrets_dir = tmp_path / 'secrets'
+    _write_version(secrets_dir, 'v1')
+
+    class Settings(_VersionedSettings):
+        model_config = SettingsConfigDict(secrets_dir=secrets_dir)
+
+    probe = 0
+
+    def always_changing_generation(cls, path):
+        nonlocal probe
+        probe += 1
+        return (probe,)
+
+    monkeypatch.setattr(
+        NestedSecretsSettingsSource, '_directory_generation', classmethod(always_changing_generation)
+    )
+
+    with pytest.raises(SettingsError, match='kept changing while loading'):
+        Settings()
+    assert probe == 2 * SECRETS_DIR_MAX_LOAD_ATTEMPTS
+
+
+def test_load_secrets_missing_directory_returns_empty(tmp_path):
+    """A directory absent at load time still yields no secrets (missing option handled earlier)."""
+    assert NestedSecretsSettingsSource.load_secrets(tmp_path / 'absent') == {}
+
+
+def test_directory_precedence_kept_when_a_switch_happens(tmp_path):
+    """Last-directory-wins precedence survives a switch: each directory loads one version first.
+
+    Two configured directories are merged in order. The earlier one switches mid-load and
+    must be re-read as a consistent version before the later directory overrides it.
+    """
+    first_v1, first_v2 = tmp_path / 'first-v1', tmp_path / 'first-v2'
+    _write_version(first_v1, 'v1')
+    _write_version(first_v2, 'v2')
+    current = tmp_path / 'first-current'
+    _point_current(current, first_v1)
+
+    override = tmp_path / 'override'
+    override.mkdir()
+    (override / 'key_value').write_text('value-override')
+
+    class Settings(_VersionedSettings):
+        model_config = SettingsConfigDict(secrets_dir=[current, override])
+
+    real_read_text = Path.read_text
+    switched = False
+
+    def switching_read_text(self, encoding=None, *args, **kwargs):
+        nonlocal switched
+        result = real_read_text(self, encoding=encoding, *args, **kwargs)
+        if not switched and self.name == 'key_id' and first_v1 in self.resolve().parents:
+            _point_current(current, first_v2)
+            switched = True
+        return result
+
+    with patch.object(Path, 'read_text', switching_read_text):
+        settings = Settings()
+
+    assert switched
+    # key_id comes from the re-read first directory, key_value is overridden by the last directory
+    assert settings.model_dump() == {'key_id': 'id-v2', 'key_value': 'value-override'}
