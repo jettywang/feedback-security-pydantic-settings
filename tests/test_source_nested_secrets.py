@@ -2,6 +2,7 @@ from enum import StrEnum
 from os import sep
 from pathlib import Path
 from unittest.mock import patch
+import warnings
 
 import pytest
 from pydantic import BaseModel
@@ -853,3 +854,247 @@ def test_load_secrets_utf8_under_non_utf8_locale(tmp_path, non_utf8_default_enco
     (tmp_path / 'token').write_bytes('café-pässwörd'.encode())
 
     assert NestedSecretsSettingsSource.load_secrets(tmp_path) == {'token': 'café-pässwörd'}
+
+
+LEGACY_DELIMITER = '__'
+
+
+class LegacyDb(BaseModel):
+    user: str | None = None
+    passwd: str | None = None
+
+
+class _LegacySettings(BaseSettings):
+    """Settings used by the flat- to subdirectory-layout transition tests."""
+
+    app_key: str | None = None
+    db: LegacyDb
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        return (NestedSecretsSettingsSource(file_secret_settings),)
+
+
+def _write_both_layouts(root: Path) -> None:
+    """Populate one directory with the new subdirectory layout and legacy flat files.
+
+    ``db/passwd`` exists in both layouts (a collision); ``db/user`` exists only in the
+    legacy layout; ``app_key`` exists only in the current layout.
+    """
+    (root / 'db').mkdir(parents=True)
+    (root / 'db' / 'passwd').write_text('current-passwd')
+    (root / 'app_key').write_text('current-app')
+    (root / 'db__passwd').write_text('legacy-passwd')
+    (root / 'db__user').write_text('legacy-user')
+
+
+def test_legacy_fallback_off_keeps_current_only_read_rules(tmp_path):
+    """Without the transition option, legacy flat files are not read at all."""
+    _write_both_layouts(tmp_path)
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(secrets_dir=tmp_path, secrets_nested_subdir=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        settings = Settings()
+
+    assert settings.model_dump() == {
+        'app_key': 'current-app',
+        'db': {'user': None, 'passwd': 'current-passwd'},
+    }
+
+
+def test_legacy_fallback_fills_missing_and_current_wins_on_collision(tmp_path):
+    """With the option on, legacy fills gaps and the current layout wins collisions."""
+    _write_both_layouts(tmp_path)
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+        )
+
+    with pytest.warns(UserWarning, match='db/passwd') as record:
+        settings = Settings()
+
+    assert settings.model_dump() == {
+        'app_key': 'current-app',
+        'db': {'user': 'legacy-user', 'passwd': 'current-passwd'},
+    }
+    # exactly one collision, reported once; neither secret value appears in the message
+    collision_messages = [str(w.message) for w in record]
+    assert len(collision_messages) == 1
+    message = collision_messages[0]
+    assert 'current-passwd' not in message
+    assert 'legacy-passwd' not in message
+
+
+def test_legacy_fallback_warns_once_per_colliding_field(tmp_path):
+    """Each colliding field is reported, while legacy-only and current-only fields stay silent."""
+    (tmp_path / 'db').mkdir(parents=True)
+    (tmp_path / 'db' / 'passwd').write_text('cur-passwd')
+    (tmp_path / 'db' / 'user').write_text('cur-user')
+    (tmp_path / 'db__passwd').write_text('leg-passwd')
+    (tmp_path / 'db__user').write_text('leg-user')
+    # a legacy-only field must not trigger a warning
+    (tmp_path / 'db__host').write_text('leg-host')
+
+    class DbHost(LegacyDb):
+        host: str | None = None
+
+    class SettingsWithHost(_LegacySettings):
+        db: DbHost
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+        )
+
+    with pytest.warns(UserWarning) as record:
+        settings = SettingsWithHost()
+
+    fields = sorted(str(w.message).split('field ')[1].split(' ')[0] for w in record)
+    assert fields == ["'db/passwd'", "'db/user'"]
+    assert settings.model_dump() == {
+        'app_key': None,
+        'db': {'user': 'cur-user', 'passwd': 'cur-passwd', 'host': 'leg-host'},
+    }
+
+
+def test_legacy_fallback_requires_subdir_mode(tmp_path):
+    """The transition option only makes sense alongside the subdirectory layout."""
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_delimiter=LEGACY_DELIMITER,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+        )
+
+    with pytest.raises(SettingsError, match='requires secrets_nested_subdir'):
+        Settings()
+
+
+def test_legacy_fallback_delimiter_must_differ_from_path_separator(tmp_path):
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=sep,
+        )
+
+    with pytest.raises(SettingsError, match='path separator'):
+        Settings()
+
+
+def test_legacy_fallback_across_two_temporary_directories(tmp_path):
+    """Old flat layout and new subdirectory layout live in separate directories.
+
+    The new-layout directory is listed last, mirroring its higher precedence. Legacy
+    values fill fields missing from the new layout; overlapping fields take the new
+    value and report a collision.
+    """
+    old_dir = tmp_path / 'old-flat'
+    new_dir = tmp_path / 'new-nested'
+    old_dir.mkdir()
+    new_dir.mkdir()
+
+    # legacy flat layout: one field overlaps the new layout, one is legacy-only
+    (old_dir / 'db__passwd').write_text('legacy-passwd')
+    (old_dir / 'db__user').write_text('legacy-user')
+    # new subdirectory layout: provides the colliding field and a current-only one
+    (new_dir / 'db').mkdir()
+    (new_dir / 'db' / 'passwd').write_text('new-passwd')
+    (new_dir / 'app_key').write_text('new-app')
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=[old_dir, new_dir],
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+        )
+
+    with pytest.warns(UserWarning, match='db/passwd') as record:
+        settings = Settings()
+
+    assert settings.model_dump() == {
+        'app_key': 'new-app',
+        'db': {'user': 'legacy-user', 'passwd': 'new-passwd'},
+    }
+    message = str(record[0].message)
+    assert 'new-passwd' not in message
+    assert 'legacy-passwd' not in message
+
+
+def test_legacy_fallback_off_two_directories_ignore_flat_files(tmp_path):
+    """Same two directories, but with the transition option disabled: flat files are inert."""
+    old_dir = tmp_path / 'old-flat'
+    new_dir = tmp_path / 'new-nested'
+    old_dir.mkdir()
+    new_dir.mkdir()
+    (old_dir / 'db__user').write_text('legacy-user')
+    (new_dir / 'db').mkdir()
+    (new_dir / 'db' / 'passwd').write_text('new-passwd')
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=[old_dir, new_dir],
+            secrets_nested_subdir=True,
+        )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        settings = Settings()
+
+    assert settings.model_dump() == {
+        'app_key': None,
+        'db': {'user': None, 'passwd': 'new-passwd'},
+    }
+
+
+def test_legacy_fallback_collision_is_case_insensitive(tmp_path):
+    """Legacy and current keys differing only by case still resolve to the same field."""
+    (tmp_path / 'db').mkdir(parents=True)
+    (tmp_path / 'db' / 'passwd').write_text('current-passwd')
+    (tmp_path / 'DB__PASSWD').write_text('legacy-passwd')
+
+    class Settings(_LegacySettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+            secrets_case_sensitive=False,
+        )
+
+    with pytest.warns(UserWarning, match='db/passwd'):
+        settings = Settings()
+
+    assert settings.db.passwd == 'current-passwd'
+
+
+def test_legacy_fallback_config_key_ignored_without_nested_source(tmp_path):
+    """Without a NestedSecretsSettingsSource the option is inert, like the other secrets keys."""
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(
+            secrets_dir=tmp_path,
+            secrets_nested_subdir=True,
+            secrets_legacy_delimiter=LEGACY_DELIMITER,
+        )
+
+        value: str | None = None
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter('always')
+        assert Settings().value is None
+
+    assert any('secrets_legacy_delimiter' in str(w.message) for w in record)

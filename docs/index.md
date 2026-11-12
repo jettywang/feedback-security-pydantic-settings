@@ -2643,6 +2643,98 @@ class Settings(BaseSettings):
         )
 ```
 
+### Migrating from a Flat Secrets Directory
+
+When moving from the flat layout (one file per field, with nested fields encoded in the file name) to the
+subdirectory layout (one folder per submodel), the two layouts often have to coexist while deployments are
+rolled over one at a time. `secrets_legacy_delimiter` provides a reversible switch for that transition window.
+
+Consider a model with a nested `db` submodel. The layouts look like this:
+
+```text title="Legacy flat layout"
+📂 secrets
+├── 📄 app_key
+└── 📄 db__passwd        # nested field encoded in the file name
+```
+
+```text title="Current subdirectory layout"
+📂 secrets
+├── 📄 app_key
+└── 📂 db
+    └── 📄 passwd        # nested field encoded in the folder structure
+```
+
+Turn the fallback on by naming the delimiter the legacy files used. With it enabled, the source reads both
+layouts: legacy files fill fields that the subdirectory layout does not provide yet, the subdirectory layout
+takes precedence wherever both define a field, and each overlap raises a `UserWarning` naming the field.
+
+```py
+from pydantic import BaseModel, SecretStr
+
+from pydantic_settings import (
+    BaseSettings,
+    NestedSecretsSettingsSource,
+    SettingsConfigDict,
+)
+
+
+class DbSettings(BaseModel):
+    user: str
+    passwd: SecretStr
+
+
+class Settings(BaseSettings):
+    app_key: SecretStr
+    db: DbSettings
+
+    model_config = SettingsConfigDict(
+        secrets_dir='/run/secrets',
+        secrets_nested_subdir=True,
+        # Transitional: accept legacy flat files such as `db__passwd` while migrating.
+        secrets_legacy_delimiter='__',
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            NestedSecretsSettingsSource(file_secret_settings),
+        )
+```
+
+The same option works when the layouts are mounted in separate directories. List them on `secrets_dir`; order
+does not change precedence here — the subdirectory layout still wins on overlap — but listing the new layout
+last matches the "later directories override earlier ones" convention used elsewhere:
+
+```py
+model_config = SettingsConfigDict(
+    secrets_dir=['/run/secrets-legacy', '/run/secrets'],
+    secrets_nested_subdir=True,
+    secrets_legacy_delimiter='__',
+)
+```
+
+Recommended rollout:
+
+1. Deploy with `secrets_legacy_delimiter` set, while only the legacy layout exists — values keep loading.
+2. Add subdirectory files field by field. Each migrated field flips to the new value automatically; any field
+   still present in both emits a collision warning, so monitor warnings to track outstanding overlaps.
+3. Once no collision warnings remain, remove the legacy files and delete `secrets_legacy_delimiter`. With the
+   option unset, reading returns to the strict subdirectory-layout rules, ignoring any stray flat file.
+
+!!! warning
+    Collision warnings contain field names and paths, never secret values. Do not log file contents yourself
+    when handling these warnings.
+
 ### Configuration Options
 
 !!! note
@@ -2706,6 +2798,27 @@ like `/run/secrets/model/delim/nested1/delim/nested2`.
 
 Boolean flag to turn on _nested secrets directory_ mode, `False` by default. If `True`, sets `secrets_nested_delimiter`
 to `os.sep`. Raises `SettingsError` if `secrets_nested_delimiter` is already specified.
+
+#### secrets_legacy_delimiter
+
+Optional string enabling a transitional fallback while migrating from the flat file-name layout to the
+subdirectory layout. It is only read by `NestedSecretsSettingsSource` and requires `secrets_nested_subdir=True`.
+
+In the legacy flat layout a nested field was encoded with a delimiter inside a single top-level file name,
+e.g. `db__passwd`; in the current subdirectory layout the same field lives at `db/passwd`. Setting
+`secrets_legacy_delimiter='__'` makes the source read **both** layouts during the migration window:
+
+* a field present only in the legacy flat layout is filled from that file;
+* a field present in the current subdirectory layout always wins, even when the legacy layout also defines it;
+* when both layouts define the same field, a `UserWarning` names the colliding field so it can be tracked down.
+
+The warning reports the field name only — it never prints the secret value or file contents. Legacy keys are
+rewritten by replacing the legacy delimiter with the path separator, so `db__passwd` and `db/passwd` resolve to
+the same nested field. A value must differ from `os.sep`, otherwise the two layouts cannot be distinguished;
+setting it without `secrets_nested_subdir=True`, or leaving it unset (the default), keeps the strict
+current-layout-only reading rules with no fallback and no extra warnings.
+
+See [Migrating from a Flat Secrets Directory](#migrating-from-a-flat-secrets-directory) for a worked example.
 
 #### secrets_prefix
 

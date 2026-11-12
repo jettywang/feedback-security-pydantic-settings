@@ -95,6 +95,7 @@ class SettingsConfigDict(ConfigDict, total=False):
     secrets_prefix: str | None
     secrets_nested_delimiter: str | None
     secrets_nested_subdir: bool | None
+    secrets_legacy_delimiter: str | None
     json_file: ConfigFileSourceType | None
     json_file_encoding: str | None
     yaml_file: ConfigFileSourceType | None
@@ -662,6 +663,7 @@ class BaseSettings(BaseModel):
                 'secrets_prefix',
                 'secrets_nested_delimiter',
                 'secrets_nested_subdir',
+                'secrets_legacy_delimiter',
             ),
         )
 
@@ -709,6 +711,7 @@ class BaseSettings(BaseModel):
         secrets_prefix=None,
         secrets_nested_delimiter=None,
         secrets_nested_subdir=None,
+        secrets_legacy_delimiter=None,
         protected_namespaces=(
             'model_validate',
             'model_dump',

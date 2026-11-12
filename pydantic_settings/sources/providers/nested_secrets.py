@@ -31,6 +31,7 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
         secrets_prefix: str | None = None,
         secrets_nested_delimiter: str | None = None,
         secrets_nested_subdir: bool | None = None,
+        secrets_legacy_delimiter: str | None = None,
         # args for compatibility with SecretsSettingsSource, don't use directly
         case_sensitive: bool | None = None,
         env_prefix: str | None = None,
@@ -95,6 +96,25 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
                 raise SettingsError('Options secrets_nested_delimiter and secrets_nested_subdir are mutually exclusive')
             self.secrets_nested_delimiter = os.sep
 
+        # Transitional fallback for the flat-layout -> subdirectory-layout migration.
+        # Only meaningful in subdirectory mode, where the new layout splits fields with
+        # ``os.sep``; the legacy flat files used a delimiter inside a single file name.
+        self.secrets_legacy_delimiter: str | None = first_not_none(
+            secrets_legacy_delimiter,
+            conf.get('secrets_legacy_delimiter'),
+        )
+        if self.secrets_legacy_delimiter is not None:
+            if not self.secrets_nested_subdir:
+                raise SettingsError(
+                    'Option secrets_legacy_delimiter requires secrets_nested_subdir=True; '
+                    'it only supports the flat-layout to subdirectory-layout migration'
+                )
+            if self.secrets_legacy_delimiter == os.sep:
+                raise SettingsError(
+                    'Option secrets_legacy_delimiter must differ from the path separator; '
+                    'otherwise legacy and current layouts cannot be told apart'
+                )
+
         # ensure valid secrets_path
         paths = [] if self.secrets_dir is None else _as_list(self.secrets_dir)
         self.secrets_paths: list[Path] = [Path(p).expanduser().resolve() for p in paths]
@@ -125,10 +145,55 @@ class NestedSecretsSettingsSource(EnvSettingsSource):
         # Normalize each directory before merging so that the last directory wins. Merging
         # raw filenames first would keep the earlier key's insertion position, so a later
         # ``TOKEN`` could not displace an earlier ``token`` once names are case-folded.
-        secrets: dict[str, str | None] = {}
+        if self.secrets_legacy_delimiter is None:
+            secrets: dict[str, str | None] = {}
+            for path in self.secrets_paths:
+                secrets.update(self._parse_env_vars(self.load_secrets(path)))
+            return secrets
+
+        # Transitional flat- -> subdirectory-layout migration. Current- and legacy-layout
+        # entries are accumulated separately across every directory (each directory still
+        # wins over earlier ones within its own layout), then combined with current priority.
+        current: dict[str, str | None] = {}
+        legacy: dict[str, str | None] = {}
         for path in self.secrets_paths:
-            secrets.update(self._parse_env_vars(self.load_secrets(path)))
-        return secrets
+            raw_current, raw_legacy = self._split_legacy_secrets(self.load_secrets(path))
+            current.update(self._parse_env_vars(raw_current))
+            legacy.update(self._parse_env_vars(raw_legacy))
+
+        for key in sorted(current.keys() & legacy.keys()):
+            # Report the colliding field only: never include either file's contents.
+            warnings.warn(
+                f'Secret field {key!r} is present in both the current subdirectory layout '
+                f'and the legacy flat layout; using the current layout value.',
+                stacklevel=2,
+            )
+        # Legacy fills only what the current layout does not provide; current wins on collision.
+        return {**legacy, **current}
+
+    def _split_legacy_secrets(self, raw: Mapping[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+        """Split loaded secrets into current-layout and legacy-layout mappings.
+
+        ``raw`` maps paths relative to a ``secrets_dir`` to their stripped contents. In
+        subdirectory mode the current layout places nested fields beneath subdirectories, so
+        their relative keys contain ``os.sep``. The legacy flat layout encoded the same nesting
+        with a delimiter inside a single top-level file name, so legacy keys contain no path
+        separator but do contain ``secrets_legacy_delimiter``.
+
+        Legacy keys are rewritten to the canonical (separator-joined) form so that, once parsed,
+        they address the same nested field as their current-layout counterpart.
+        """
+        legacy_delimiter = self.secrets_legacy_delimiter
+        assert legacy_delimiter is not None  # this helper only runs while the fallback is enabled
+        current: dict[str, str] = {}
+        legacy: dict[str, str] = {}
+        for key, value in raw.items():
+            if os.sep not in key and legacy_delimiter in key:
+                canonical = key.replace(legacy_delimiter, os.sep)
+                legacy[canonical] = value
+            else:
+                current[key] = value
+        return current, legacy
 
     def validate_secrets_path(self, path: Path) -> None:
         if not path.exists():
