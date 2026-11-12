@@ -1,4 +1,11 @@
-from .exceptions import IncompleteFieldDefinitionWarning, SettingsError
+from .exceptions import (
+    IncompleteFieldDefinitionWarning,
+    SettingsError,
+    SettingsSourceError,
+    SettingsSourceFallbackWarning,
+    SourceAccessDeniedError,
+    SourceUnavailableError,
+)
 from .main import BaseSettings, CliApp, SettingsConfigDict
 from .sources import (
     CLI_SUPPRESS,
@@ -65,6 +72,10 @@ __all__ = (
     'SecretsSettingsSource',
     'SettingsConfigDict',
     'SettingsError',
+    'SettingsSourceError',
+    'SettingsSourceFallbackWarning',
+    'SourceAccessDeniedError',
+    'SourceUnavailableError',
     'TomlConfigSettingsSource',
     'YamlConfigSettingsSource',
     '__version__',

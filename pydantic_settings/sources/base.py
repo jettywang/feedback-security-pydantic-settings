@@ -18,7 +18,7 @@ from pydantic._internal._utils import is_model_class
 from pydantic.fields import FieldInfo
 from typing_inspection.introspection import is_union_origin
 
-from ..exceptions import SettingsError
+from ..exceptions import SettingsError, SettingsSourceError
 from ..utils import deep_update
 from .types import (
     ConfigFileSourceType,
@@ -121,6 +121,21 @@ class PydanticBaseSettingsSource(ABC):
         self.config = settings_cls.model_config
         self._current_state: dict[str, Any] = {}
         self._settings_sources_data: dict[str, dict[str, Any]] = {}
+        # Field names allowed to fall back to lower-priority sources when this source is
+        # temporarily unavailable. `None` (the default) means any source failure halts
+        # settings resolution. Sources that support the declaration take it as a
+        # constructor argument (e.g. `AzureKeyVaultSettingsSource`).
+        self.fallback_fields: frozenset[str] | None = None
+
+    def _classify_error(self, exc: Exception) -> SettingsSourceError | None:
+        """Translate a backend exception into a `SettingsSourceError`.
+
+        Sources backed by a remote service override this to distinguish transient
+        unavailability (`SourceUnavailableError`) from confirmed access denials
+        (`SourceAccessDeniedError`). Returning `None` leaves the exception to be
+        handled (or wrapped) as before.
+        """
+        return exc if isinstance(exc, SettingsSourceError) else None
 
     def _set_current_state(self, state: dict[str, Any]) -> None:
         """
@@ -721,6 +736,9 @@ class PydanticBaseEnvSettingsSource(PydanticBaseSettingsSource):
             try:
                 field_value, field_key, value_is_complex = self._get_resolved_field_value(field, field_name)
             except Exception as e:
+                classified = self._classify_error(e)
+                if classified is not None:
+                    raise classified from e
                 raise SettingsError(
                     f'error getting value for field "{field_name}" from source "{self.__class__.__name__}"'
                 ) from e

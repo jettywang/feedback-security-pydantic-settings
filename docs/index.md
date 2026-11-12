@@ -2974,6 +2974,60 @@ This setup will load Azure Key Vault secrets named `field-with-underscore`, `Ali
 !!! tip
     Alternatively, you can configure an [alias_generator](alias.md#using-alias-generators) to map PascalCase secrets.
 
+### Fallback when the vault is unavailable
+
+Remote sources can fail at startup in two different ways, and the merge handles them differently:
+
+- **Temporarily unavailable** (timeout, connection failure, HTTP 408/429/5xx): a `SourceUnavailableError` is raised.
+  If the source declared `fallback_fields`, the source is skipped, a `SettingsSourceFallbackWarning` naming the
+  source and the declared fields is emitted, and those fields are resolved from lower-priority sources
+  (e.g. local defaults or environment variables). Without a declaration, startup halts.
+- **Access denied** (authentication failure, HTTP 401/403): a `SourceAccessDeniedError` is raised and startup
+  always halts — a confirmed permission problem never falls back silently.
+
+Both errors carry a `source_name` attribute identifying the failing source, and chain the original SDK
+exception as `__cause__`.
+
+```py
+import os
+
+from azure.identity import DefaultAzureCredential
+
+from pydantic_settings import (
+    AzureKeyVaultSettingsSource,
+    BaseSettings,
+    PydanticBaseSettingsSource,
+)
+
+
+class AzureKeyVaultSettings(BaseSettings):
+    # Local defaults keep the test environment working; production declares them
+    # as fallback fields so a transient vault outage does not block startup.
+    api_key: str = 'local-dev-key'
+    db_password: str = 'local-dev-password'
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        az_key_vault_settings = AzureKeyVaultSettingsSource(
+            settings_cls,
+            os.environ['AZURE_KEY_VAULT_URL'],
+            DefaultAzureCredential(),
+            fallback_fields={'api_key', 'db_password'},
+        )
+        return (az_key_vault_settings, init_settings, env_settings)
+```
+
+Custom sources can opt into the same mechanism: raise `SourceUnavailableError` or `SourceAccessDeniedError`
+from the source (or override `PydanticBaseSettingsSource._classify_error` to translate backend exceptions)
+and set the source's `fallback_fields` attribute to the field names allowed to degrade.
+
 ## Google Cloud Secret Manager
 
 Google Cloud Secret Manager allows you to store, manage, and access sensitive information as secrets in Google Cloud Platform. This integration lets you retrieve secrets directly from GCP Secret Manager for use in your Pydantic settings.

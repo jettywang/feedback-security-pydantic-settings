@@ -9,6 +9,11 @@ from pydantic.alias_generators import to_snake
 from pydantic.fields import FieldInfo
 from typing_inspection.introspection import is_union_origin
 
+from ...exceptions import (
+    SettingsSourceError,
+    SourceAccessDeniedError,
+    SourceUnavailableError,
+)
 from ...utils import _lenient_issubclass
 from ..utils import (
     InitState,
@@ -23,13 +28,23 @@ from .env import EnvSettingsSource
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
-    from azure.core.exceptions import ResourceNotFoundError
+    from azure.core.exceptions import (
+        ClientAuthenticationError,
+        HttpResponseError,
+        ResourceNotFoundError,
+        ServiceRequestError,
+        ServiceResponseError,
+    )
     from azure.keyvault.secrets import SecretClient
 
     from pydantic_settings.main import BaseSettings
 else:
     TokenCredential = None
+    ClientAuthenticationError = None
+    HttpResponseError = None
     ResourceNotFoundError = None
+    ServiceRequestError = None
+    ServiceResponseError = None
     SecretClient = None
 
 
@@ -37,10 +52,20 @@ def import_azure_key_vault() -> None:
     global TokenCredential
     global SecretClient
     global ResourceNotFoundError
+    global ClientAuthenticationError
+    global HttpResponseError
+    global ServiceRequestError
+    global ServiceResponseError
 
     try:
         from azure.core.credentials import TokenCredential
-        from azure.core.exceptions import ResourceNotFoundError
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ResourceNotFoundError,
+            ServiceRequestError,
+            ServiceResponseError,
+        )
         from azure.keyvault.secrets import SecretClient
     except ImportError as e:  # pragma: no cover
         raise ImportError(
@@ -82,7 +107,15 @@ class AzureKeyVaultMapping(Mapping[str, str | None]):
         self._snake_case_conversion = snake_case_conversion
         self._env_prefix = env_prefix or ''
         self._env_parse_none_str = env_parse_none_str
-        self._secret_map: dict[str, str] = self._load_remote()
+        # Loaded lazily on first access so that remote failures surface while the
+        # source is called during the settings merge, not while it is constructed.
+        self._secret_map: dict[str, str] | None = None
+
+    @property
+    def _resolved_secret_map(self) -> dict[str, str]:
+        if self._secret_map is None:
+            self._secret_map = self._load_remote()
+        return self._secret_map
 
     def _load_remote(self) -> dict[str, str]:
         secret_names: Iterator[str] = (
@@ -116,18 +149,18 @@ class AzureKeyVaultMapping(Mapping[str, str | None]):
             new_key = key.lower()
 
         if new_key not in self._loaded_secrets:
-            if new_key in self._secret_map:
-                self._loaded_secrets[new_key] = self._secret_client.get_secret(self._secret_map[new_key]).value
+            if new_key in self._resolved_secret_map:
+                self._loaded_secrets[new_key] = self._secret_client.get_secret(self._resolved_secret_map[new_key]).value
             else:
                 raise KeyError(key)
 
         return _parse_env_none_str(self._loaded_secrets[new_key], self._env_parse_none_str)
 
     def __len__(self) -> int:
-        return len(self._secret_map)
+        return len(self._resolved_secret_map)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._secret_map.keys())
+        return iter(self._resolved_secret_map.keys())
 
 
 class AzureKeyVaultSettingsSource(EnvSettingsSource):
@@ -145,6 +178,7 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
         env_prefix: str | None = None,
         env_parse_none_str: str | None = None,
         env_parse_enums: bool | None = None,
+        fallback_fields: Iterable[str] | None = None,
         _init_state: InitState | None = None,
     ) -> None:
         import_azure_key_vault()
@@ -162,6 +196,8 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
             env_parse_enums=env_parse_enums,
             _init_state=_init_state,
         )
+        if fallback_fields is not None:
+            self.fallback_fields = frozenset(fallback_fields)
 
     def _load_env_vars(self) -> Mapping[str, str | None]:
         secret_client = SecretClient(vault_url=self._url, credential=self._credential)
@@ -237,6 +273,29 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
                     env_name = self._apply_case_sensitive(field_key).replace('_', '-')
                     targets.setdefault(env_name, []).append((field_key, field.annotation))
         return targets
+
+    _ACCESS_DENIED_STATUS_CODES = (401, 403)
+    _UNAVAILABLE_STATUS_CODES = (408, 429, 500, 502, 503, 504)
+
+    def _classify_error(self, exc: Exception) -> SettingsSourceError | None:
+        classified = super()._classify_error(exc)
+        if classified is not None:
+            return classified
+        source_name = f'{type(self).__name__}(url={self._url!r})'
+        status_code = getattr(exc, 'status_code', None)
+        if (ClientAuthenticationError is not None and isinstance(exc, ClientAuthenticationError)) or (
+            status_code in self._ACCESS_DENIED_STATUS_CODES
+        ):
+            return SourceAccessDeniedError(
+                'access to the key vault was denied; check the credential and its role assignments',
+                source_name=source_name,
+            )
+        unavailable_types = tuple(
+            t for t in (ServiceRequestError, ServiceResponseError) if t is not None
+        ) + (TimeoutError, ConnectionError)
+        if isinstance(exc, unavailable_types) or status_code in self._UNAVAILABLE_STATUS_CODES:
+            return SourceUnavailableError('the key vault is temporarily unavailable', source_name=source_name)
+        return None
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(url={self._url!r}, env_nested_delimiter={self.env_nested_delimiter!r})'

@@ -18,7 +18,13 @@ from pydantic.dataclasses import is_pydantic_dataclass
 from pydantic.fields import FieldInfo
 from pydantic.main import BaseModel
 
-from .exceptions import SettingsError
+from .exceptions import (
+    SettingsError,
+    SettingsSourceError,
+    SettingsSourceFallbackWarning,
+    SourceAccessDeniedError,
+    SourceUnavailableError,
+)
 from .sources import (
     ENV_FILE_SENTINEL,
     CliSettingsSource,
@@ -536,7 +542,10 @@ class BaseSettings(BaseModel):
                     source._set_settings_sources_data(states)
 
                 source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
-                source_state = source()
+                try:
+                    source_state = source()
+                except Exception as e:
+                    source_state = cls._settings_handle_source_error(source, source_name, e)
 
                 if isinstance(source, DefaultSettingsSource):
                     defaults = source_state
@@ -563,6 +572,37 @@ class BaseSettings(BaseModel):
         # no one should mean to do this, but I think returning an empty dict is marginally preferable
         # to an informative error and much better than a confusing error
         return {}
+
+    @staticmethod
+    def _settings_handle_source_error(
+        source: Any, source_name: str, exc: Exception
+    ) -> dict[str, Any]:
+        """Apply the source's fallback policy when it fails during the merge.
+
+        A `SourceAccessDeniedError` always halts resolution. A `SourceUnavailableError`
+        halts resolution unless the source declared `fallback_fields`, in which case the
+        source is skipped with a `SettingsSourceFallbackWarning` and the declared fields
+        are left to lower-priority sources. Any other exception propagates unchanged.
+        """
+        error = exc if isinstance(exc, SettingsSourceError) else None
+        if error is None and isinstance(source, PydanticBaseSettingsSource):
+            error = source._classify_error(exc)
+        if error is None:
+            raise exc
+        if isinstance(error, SourceUnavailableError):
+            fallback_fields = getattr(source, 'fallback_fields', None)
+            if fallback_fields:
+                origin = error.source_name or source_name
+                warnings.warn(
+                    f'{origin} is temporarily unavailable; falling back to lower-priority sources '
+                    f'for fields {sorted(fallback_fields)} (original error: {exc.__cause__ or exc})',
+                    SettingsSourceFallbackWarning,
+                    stacklevel=2,
+                )
+                return {}
+        if error is exc:
+            raise error
+        raise error from exc
 
     @classmethod
     def _settings_log_debug(cls, states: dict[str, dict[str, Any]]) -> None:
