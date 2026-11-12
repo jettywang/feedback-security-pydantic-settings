@@ -20,6 +20,7 @@ from ..utils import (
     _strip_annotated,
 )
 from .env import EnvSettingsSource
+from .secret_lookup import LookupBudget
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
@@ -64,7 +65,6 @@ def _collect_nested_types(annotation: Any, models: list[Any], dict_value_types: 
 
 
 class AzureKeyVaultMapping(Mapping[str, str | None]):
-    _loaded_secrets: dict[str, str | None]
     _secret_client: SecretClient
     _secret_names: list[str]
 
@@ -75,14 +75,21 @@ class AzureKeyVaultMapping(Mapping[str, str | None]):
         snake_case_conversion: bool,
         env_prefix: str | None,
         env_parse_none_str: str | None = None,
+        max_secret_lookups: int | None = None,
     ) -> None:
-        self._loaded_secrets = {}
         self._secret_client = secret_client
         self._case_sensitive = case_sensitive
         self._snake_case_conversion = snake_case_conversion
         self._env_prefix = env_prefix or ''
         self._env_parse_none_str = env_parse_none_str
+        # Per-construction budget and cache: a secret reached through several aliases is
+        # fetched once, and a new construction re-reads values updated in the vault.
+        self._lookup_budget: LookupBudget[str | None] = LookupBudget(max_secret_lookups)
         self._secret_map: dict[str, str] = self._load_remote()
+
+    @property
+    def lookup_budget(self) -> LookupBudget[str | None]:
+        return self._lookup_budget
 
     def _load_remote(self) -> dict[str, str]:
         secret_names: Iterator[str] = (
@@ -115,13 +122,18 @@ class AzureKeyVaultMapping(Mapping[str, str | None]):
         elif not self._case_sensitive:
             new_key = key.lower()
 
-        if new_key not in self._loaded_secrets:
-            if new_key in self._secret_map:
-                self._loaded_secrets[new_key] = self._secret_client.get_secret(self._secret_map[new_key]).value
-            else:
-                raise KeyError(key)
+        remote_name = self._secret_map.get(new_key)
+        if remote_name is None:
+            raise KeyError(key)
 
-        return _parse_env_none_str(self._loaded_secrets[new_key], self._env_parse_none_str)
+        # The remote secret name is the cache key, so several normalized keys pointing
+        # at the same vault secret share a single get_secret call.
+        value = self._lookup_budget.get(
+            remote_name,
+            new_key,
+            lambda: self._secret_client.get_secret(remote_name).value,
+        )
+        return _parse_env_none_str(value, self._env_parse_none_str)
 
     def __len__(self) -> int:
         return len(self._secret_map)
@@ -145,6 +157,7 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
         env_prefix: str | None = None,
         env_parse_none_str: str | None = None,
         env_parse_enums: bool | None = None,
+        max_secret_lookups: int | None = None,
         _init_state: InitState | None = None,
     ) -> None:
         import_azure_key_vault()
@@ -152,6 +165,7 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
         self._credential = credential
         self._dash_to_underscore = dash_to_underscore
         self._snake_case_conversion = snake_case_conversion
+        self._max_secret_lookups = max_secret_lookups
         super().__init__(
             settings_cls,
             case_sensitive=True if snake_case_conversion else case_sensitive,
@@ -171,6 +185,7 @@ class AzureKeyVaultSettingsSource(EnvSettingsSource):
             snake_case_conversion=self._snake_case_conversion,
             env_prefix=self.env_prefix,
             env_parse_none_str=self.env_parse_none_str,
+            max_secret_lookups=self._max_secret_lookups,
         )
 
     def _extract_field_info(

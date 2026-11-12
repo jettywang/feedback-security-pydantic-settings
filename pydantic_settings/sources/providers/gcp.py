@@ -11,6 +11,7 @@ from ...exceptions import SettingsError
 from ..types import SecretVersion
 from ..utils import InitState, _parse_env_none_str, _validate_by_name_enabled
 from .env import EnvSettingsSource
+from .secret_lookup import LookupBudget, SecretLookupError
 
 if TYPE_CHECKING:
     from google.auth import default as google_auth_default
@@ -42,17 +43,7 @@ def import_gcp_secret_manager() -> None:
         ) from e
 
 
-def _is_not_found_error(exc: Exception) -> bool:
-    try:
-        from google.api_core.exceptions import NotFound
-
-        return isinstance(exc, NotFound)
-    except ImportError:  # pragma: no cover
-        return False
-
-
 class GoogleSecretManagerMapping(Mapping[str, str | None]):
-    _loaded_secrets: dict[str, str | None]
     _secret_client: SecretManagerServiceClient
 
     def __init__(
@@ -61,12 +52,20 @@ class GoogleSecretManagerMapping(Mapping[str, str | None]):
         project_id: str,
         case_sensitive: bool,
         env_parse_none_str: str | None = None,
+        max_secret_lookups: int | None = None,
     ) -> None:
-        self._loaded_secrets = {}
         self._secret_client = secret_client
         self._project_id = project_id
         self._case_sensitive = case_sensitive
         self._env_parse_none_str = env_parse_none_str
+        # The budget is per construction: it both bounds the number of remote calls and
+        # caches their results, so the same secret reached through several aliases is
+        # fetched once while the next construction observes updated values.
+        self._lookup_budget = LookupBudget(max_secret_lookups)
+
+    @property
+    def lookup_budget(self) -> LookupBudget[str | None]:
+        return self._lookup_budget
 
     @property
     def _gcp_project_path(self) -> str:
@@ -117,44 +116,55 @@ class GoogleSecretManagerMapping(Mapping[str, str | None]):
     def _secret_version_path(self, key: str, version: str = 'latest') -> str:
         return self._secret_client.secret_version_path(self._project_id, key, version)
 
-    def _get_secret_value(self, gcp_secret_name: str, version: str = 'latest') -> str | None:
-        try:
-            value = self._secret_client.access_secret_version(
-                name=self._secret_version_path(gcp_secret_name, version)
-            ).payload.data.decode('UTF-8')
-        except Exception:
-            return None
+    def _access_secret(self, gcp_secret_name: str, version: str) -> str | None:
+        value = self._secret_client.access_secret_version(
+            name=self._secret_version_path(gcp_secret_name, version)
+        ).payload.data.decode('UTF-8')
         return _parse_env_none_str(value, self._env_parse_none_str)
+
+    def _get_secret_value(self, gcp_secret_name: str, version: str = 'latest') -> str | None:
+        """Fetch a secret, tolerating every failure by returning ``None``.
+
+        This lenient path is kept for the :class:`SecretVersion` annotation fallback,
+        whose contract is to leave the field default in place when the pinned version
+        cannot be read. It still goes through the budget so its calls are counted and
+        repeated reads share the cache.
+        """
+        try:
+            return self._lookup_budget.get(
+                (gcp_secret_name, version),
+                gcp_secret_name,
+                lambda: self._access_secret(gcp_secret_name, version),
+            )
+        except (KeyError, SecretLookupError):
+            return None
 
     def _get_secret_value_or_raise(self, gcp_secret_name: str) -> str | None:
-        try:
-            value = self._secret_client.access_secret_version(
-                name=self._secret_version_path(gcp_secret_name)
-            ).payload.data.decode('UTF-8')
-        except Exception as e:
-            if _is_not_found_error(e):
-                raise KeyError(gcp_secret_name) from e
-            return None
-        return _parse_env_none_str(value, self._env_parse_none_str)
+        """Fetch a secret, treating only a genuine missing secret as absent.
+
+        Permission and transient failures are surfaced as :class:`SecretLookupError`
+        instead of being swallowed into ``None``, so startup never continues on an
+        unverified configuration.
+        """
+        return self._lookup_budget.get(
+            (gcp_secret_name, 'latest'),
+            gcp_secret_name,
+            lambda: self._access_secret(gcp_secret_name, 'latest'),
+        )
 
     def __getitem__(self, key: str) -> str | None:
-        if key in self._loaded_secrets:
-            return self._loaded_secrets[key]
-
         if self._case_sensitive:
-            self._loaded_secrets[key] = self._get_secret_value_or_raise(key)
-            return self._loaded_secrets[key]
+            # The canonical GCP secret name is the cache key, so distinct request keys
+            # normalizing to the same secret share one remote call.
+            return self._get_secret_value_or_raise(key)
 
         gcp_secret_name = self._secret_name_map.get(key)
         if gcp_secret_name is None:
             gcp_secret_name = self._secret_name_map.get(key.lower())
 
         if gcp_secret_name:
-            self._loaded_secrets[key] = self._get_secret_value(gcp_secret_name)
-        else:
-            raise KeyError(key)
-
-        return self._loaded_secrets[key]
+            return self._get_secret_value_or_raise(gcp_secret_name)
+        raise KeyError(key)
 
     def __len__(self) -> int:
         return len(self._secret_names)
@@ -180,6 +190,7 @@ class GoogleSecretManagerSettingsSource(EnvSettingsSource):
         secret_client: SecretManagerServiceClient | None = None,
         case_sensitive: bool | None = True,
         project_id_field: str = 'project_id',
+        max_secret_lookups: int | None = None,
         _init_state: InitState | None = None,
     ) -> None:
         """Settings source that reads secrets from Google Cloud Secret Manager.
@@ -194,6 +205,12 @@ class GoogleSecretManagerSettingsSource(EnvSettingsSource):
                 For example, with ``some_field: str = Field(alias='GCP_PROJECT')``,
                 previous env sources will expose the value under ``'GCP_PROJECT'``.
                 Defaults to ``'project_id'``.
+            max_secret_lookups: Maximum number of remote secret reads performed by one
+                construction of this source. Repeated or alias-colliding reads share a
+                cached result, so only distinct secrets cost a lookup. ``None`` (the
+                default) leaves the number unbounded. Exceeding the limit, or hitting a
+                permission/transient error, raises and aborts construction rather than
+                treating the configuration as missing.
 
         The ``project_id`` is resolved lazily in :meth:`__call__` rather than at
         construction time so that it can be sourced from settings resolved by previous
@@ -216,6 +233,7 @@ class GoogleSecretManagerSettingsSource(EnvSettingsSource):
         self._credentials = credentials
         self._secret_client = secret_client
         self._project_id_field = project_id_field
+        self._max_secret_lookups = max_secret_lookups
         self._env_vars_loaded = False
 
         super().__init__(
@@ -344,6 +362,7 @@ class GoogleSecretManagerSettingsSource(EnvSettingsSource):
             project_id=self._project_id,
             case_sensitive=self.case_sensitive,
             env_parse_none_str=self.env_parse_none_str,
+            max_secret_lookups=self._max_secret_lookups,
         )
 
     def __call__(self) -> dict[str, Any]:

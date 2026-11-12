@@ -119,7 +119,8 @@ class TestGoogleSecretManagerSettingsSource:
 
     def test_secret_manager_mapping_init(self, secret_manager_mapping):
         assert secret_manager_mapping._project_id == 'test-project'
-        assert len(secret_manager_mapping._loaded_secrets) == 0
+        assert len(secret_manager_mapping.lookup_budget) == 0
+        assert secret_manager_mapping.lookup_budget.calls == 0
 
     def test_secret_manager_mapping_gcp_project_path(self, secret_manager_mapping, mock_secret_client):
         secret_manager_mapping._gcp_project_path
@@ -130,11 +131,16 @@ class TestGoogleSecretManagerSettingsSource:
         assert names == ['test-secret']
 
     def test_secret_manager_mapping_getitem_access_error(self, secret_manager_mapping, mocker):
+        from pydantic_settings.sources.providers.secret_lookup import SecretLookupError
+
         secret_manager_mapping._secret_client.access_secret_version = mocker.Mock(
             side_effect=PermissionDenied('Access denied')
         )
 
-        assert secret_manager_mapping['test-secret'] is None
+        with pytest.raises(SecretLookupError) as exc_info:
+            _ = secret_manager_mapping['test-secret']
+        assert exc_info.value.category == 'permission_denied'
+        assert exc_info.value.field_path == 'test-secret'
 
     def test_case_sensitive_getitem_skips_list_secrets(self, mock_secret_client):
         """With case_sensitive=True, fetching a secret must not call list_secrets."""
@@ -151,12 +157,16 @@ class TestGoogleSecretManagerSettingsSource:
             _ = mapping['nonexistent-secret']
         mock_secret_client.list_secrets.assert_not_called()
 
-    def test_case_sensitive_getitem_permission_denied_returns_none(self, mock_secret_client, mocker):
-        """With case_sensitive=True, a PermissionDenied error must return None (not raise KeyError)."""
+    def test_case_sensitive_getitem_permission_denied_raises(self, mock_secret_client, mocker):
+        """With case_sensitive=True, a PermissionDenied error must abort instead of yielding None."""
+        from pydantic_settings.sources.providers.secret_lookup import SecretLookupError
+
         mock_secret_client.access_secret_version = mocker.Mock(side_effect=PermissionDenied('Access denied'))
         mapping = GoogleSecretManagerMapping(mock_secret_client, project_id='test-project', case_sensitive=True)
 
-        assert mapping['test-secret'] is None
+        with pytest.raises(SecretLookupError) as exc_info:
+            _ = mapping['test-secret']
+        assert exc_info.value.category == 'permission_denied'
         mock_secret_client.list_secrets.assert_not_called()
 
     def test_secret_manager_mapping_iter(self, secret_manager_mapping):
