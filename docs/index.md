@@ -3524,6 +3524,55 @@ Secret file not found, skipping: /run/secrets/api_key
     from environment variables, dotenv files, or the secrets directory. Only enable it in a trusted
     debugging context, and avoid leaving it on in production.
 
+## Checking which source supplied each field
+
+For support questions ("did this come from the environment, a file, or the default?"), `BaseSettings`
+exposes `settings_sources()`. It returns a dictionary mapping every resolved leaf field to the label
+of the source that actually supplied its value. Only field paths and source labels are included, so
+the output never contains the settings values themselves and is safe to share:
+
+```py
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Database(BaseModel):
+    host: str = 'localhost'
+    port: int = 5432
+
+
+class Settings(BaseSettings):
+    api_key: str = 'dev-key'
+    db: Database = Database()
+
+    model_config = SettingsConfigDict(env_nested_delimiter='__')
+```
+
+With `DB__PORT=6543` in the environment:
+
+```py
+import os
+
+os.environ['DB__PORT'] = '6543'
+
+print(Settings(api_key='from-init').settings_sources())
+#> {'api_key': 'InitSettingsSource', 'db.host': 'default', 'db.port': 'EnvSettingsSource'}
+```
+
+Nested models are expanded into their leaves, so a partial override is visible per leaf: `db.host`
+keeps its field default while `db.port` was overridden by the environment. Fields that are not nested
+models (scalars, lists, dictionaries) are reported as a whole.
+
+Source labels follow these rules:
+
+- a custom or built-in source is identified by its class name (e.g. `InitSettingsSource`,
+  `EnvSettingsSource`, `DotEnvSettingsSource`, `SecretsSettingsSource`, or your own source class);
+- `'default'` means no configured source supplied the leaf and the field's own default value was used.
+
+When several sources contain the same leaf, only the winner — the first source in the priority order
+that provides it — is reported. The dictionary keys always use the final model's field names, even when
+the field is populated through an alias.
+
 ## Customise settings sources
 
 If the default order of priority doesn't match your needs, it's possible to change it by overriding

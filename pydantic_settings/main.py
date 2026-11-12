@@ -5,8 +5,10 @@ import inspect
 import re
 import threading
 import warnings
+import weakref
 from argparse import Namespace
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, Self, TextIO, TypeVar, cast
 from weakref import WeakKeyDictionary
@@ -46,6 +48,7 @@ from .sources.utils import (
     InitState,
     _get_alias_names,
     _get_model_config,
+    _get_model_fields,
     _resolve_setting,
     _validate_by_alias_enabled,
     _validate_by_name_enabled,
@@ -58,6 +61,14 @@ T = TypeVar('T')
 _settings_cache: WeakKeyDictionary[type[BaseSettings], BaseSettings] = WeakKeyDictionary()
 _settings_cache_locks: WeakKeyDictionary[type[BaseSettings], threading.Lock] = WeakKeyDictionary()
 _settings_cache_guard = threading.Lock()
+
+# Winning-source label per resolved leaf path, keyed by the settings instance's id (pydantic
+# models are not hashable by default). A finalizer drops each entry when its instance is freed.
+# Only paths and source labels are retained, never the resolved values.
+_settings_field_sources: dict[int, dict[str, str]] = {}
+
+# The label used for values that no configured source supplied, i.e. plain field defaults.
+_DEFAULT_SOURCE_LABEL = 'default'
 
 
 class SettingsConfigDict(ConfigDict, total=False):
@@ -290,7 +301,9 @@ class BaseSettings(BaseModel):
             )
         )
 
-        super().__init__(**__pydantic_self__.__class__._settings_build_values(sources, init_kwargs))
+        state, source_states = __pydantic_self__.__class__._settings_collect_values(sources, init_kwargs)
+        super().__init__(**state)
+        _store_field_sources(__pydantic_self__, _build_field_sources(__pydantic_self__, source_states))
 
     @classmethod
     def settings_cached(cls) -> Self:
@@ -332,6 +345,35 @@ class BaseSettings(BaseModel):
         """
         with _settings_cache_guard:
             _settings_cache.pop(cls, None)
+
+    def settings_sources(self) -> dict[str, str]:
+        """Map each resolved leaf field to the source that actually supplied its value.
+
+        Keys are dotted paths using the final model's field names (so a nested model's leaves
+        appear as e.g. ``"db.host"``), and values are source labels: the class name of the
+        winning settings source for custom and built-in sources, or ``"default"`` when no
+        configured source supplied the leaf and the field's own default was used. Only paths
+        and source labels are returned, never the resolved values.
+
+        A nested field is expanded into its leaves so that partial overrides are visible per
+        leaf; fields that are not nested models (lists, dicts, scalars) are reported as a whole.
+        """
+        stored = _settings_field_sources.get(id(self))
+        return dict(stored if stored is not None else _build_field_sources(self, []))
+
+    def __copy__(self) -> Self:
+        copied = cast(Self, super().__copy__())
+        stored = _settings_field_sources.get(id(self))
+        if stored is not None:
+            _store_field_sources(copied, dict(stored))
+        return copied
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        copied = cast(Self, super().__deepcopy__(memo))
+        stored = _settings_field_sources.get(id(self))
+        if stored is not None:
+            _store_field_sources(copied, dict(stored))
+        return copied
 
     @classmethod
     def settings_customise_sources(
@@ -525,11 +567,24 @@ class BaseSettings(BaseModel):
     def _settings_build_values(
         cls, sources: tuple[PydanticBaseSettingsSource, ...], init_kwargs: dict[str, Any]
     ) -> dict[str, Any]:
+        state, _ = cls._settings_collect_values(sources, init_kwargs)
+        return state
+
+    @classmethod
+    def _settings_collect_values(
+        cls, sources: tuple[PydanticBaseSettingsSource, ...], init_kwargs: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+        """Resolve the merged validation state and the per-source state behind it.
+
+        The returned list keeps sources in priority order (highest priority first) as
+        ``(source label, source state)`` pairs, which drives leaf-level source tracking.
+        """
         if sources:
             state: dict[str, Any] = {}
             defaults: dict[str, Any] = {}
             default_objects: dict[str, Any] = {}
             states: dict[str, dict[str, Any]] = {}
+            source_states: list[tuple[str, dict[str, Any]]] = []
             for source in sources:
                 if isinstance(source, PydanticBaseSettingsSource):
                     source._set_current_state(state)
@@ -543,6 +598,7 @@ class BaseSettings(BaseModel):
                     default_objects = source._default_objects
 
                 states[source_name] = source_state
+                source_states.append((_source_label(source), source_state))
                 state = deep_update(source_state, state)
 
             # Strip any default values not explicitly set before returning final state
@@ -559,10 +615,10 @@ class BaseSettings(BaseModel):
             init_state = last_source._init_state if isinstance(last_source, PydanticBaseSettingsSource) else InitState()
             cls._settings_restore_init_kwarg_names(cls, init_kwargs, state, init_state)
 
-            return state
+            return state, source_states
         # no one should mean to do this, but I think returning an empty dict is marginally preferable
         # to an informative error and much better than a confusing error
-        return {}
+        return {}, []
 
     @classmethod
     def _settings_log_debug(cls, states: dict[str, dict[str, Any]]) -> None:
@@ -718,6 +774,113 @@ class BaseSettings(BaseModel):
         ),
         enable_decoding=True,
     )
+
+
+def _store_field_sources(settings: BaseSettings, field_sources: dict[str, str]) -> None:
+    """Attach the resolved leaf-source map to a settings instance without mutating its fields."""
+    instance_id = id(settings)
+    _settings_field_sources[instance_id] = field_sources
+    weakref.finalize(settings, _settings_field_sources.pop, instance_id, None)
+
+
+def _source_label(source: object) -> str:
+    """The label identifying a source in field-source tracking.
+
+    The default source (field defaults) is normalised to ``"default"``; every other source is
+    identified by its class name, so custom sources keep their own name.
+    """
+    if isinstance(source, DefaultSettingsSource):
+        return _DEFAULT_SOURCE_LABEL
+    return source.__name__ if hasattr(source, '__name__') else type(source).__name__
+
+
+def _source_state_keys(field_name: str, field_info: FieldInfo, model_cls: type[BaseSettings]) -> tuple[str, ...]:
+    """Keys under which a field's value can appear in a source state, preference order first."""
+    config = _get_model_config(model_cls)
+    validate_by_alias = _validate_by_alias_enabled(config)
+    alias_names, _ = _get_alias_names(field_name, field_info, validate_by_alias=validate_by_alias)
+    keys = list(alias_names)
+    if _validate_by_name_enabled(config) and field_name not in keys:
+        keys.append(field_name)
+    return tuple(keys)
+
+
+def _normalized_state_lookup(
+    state: dict[str, Any], keys: tuple[str, ...], case_sensitive: bool
+) -> tuple[Any, bool]:
+    """Find a field's entry in a source state by its alias/name keys."""
+    for key in keys:
+        if key in state:
+            return state[key], True
+    if not case_sensitive:
+        lowered = {key.lower() for key in keys}
+        for state_key, value in state.items():
+            if isinstance(state_key, str) and state_key.lower() in lowered:
+                return value, True
+    return None, False
+
+
+def _build_field_sources(
+    settings: BaseSettings, source_states: list[tuple[str, dict[str, Any]]]
+) -> dict[str, str]:
+    """Walk the resolved model and attribute every leaf path to its winning source.
+
+    ``source_states`` is ordered highest priority first. The first source containing a leaf
+    wins; leaves no source provided resolve to ``"default"``.
+    """
+    result: dict[str, str] = {}
+    case_sensitive = bool(settings.model_config.get('case_sensitive', False))
+    _collect_field_sources(type(settings), settings, '', source_states, case_sensitive, result)
+    return result
+
+
+def _as_source_mapping(value: Any) -> dict[str, Any] | None:
+    """The mapping representation of a source state value for nested-model traversal."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, BaseModel) and not value.__pydantic_root_model__:
+        return value.model_dump()
+    if is_dataclass(type(value)):
+        return asdict(value)
+    return None
+
+
+def _collect_field_sources(
+    model_cls: type[Any],
+    model: Any,
+    prefix: str,
+    source_states: list[tuple[str, dict[str, Any]]],
+    case_sensitive: bool,
+    result: dict[str, str],
+) -> None:
+    for field_name, field_info in _get_model_fields(model_cls).items():
+        path = f'{prefix}{field_name}'
+        keys = _source_state_keys(field_name, field_info, model_cls)
+        nested_states: list[tuple[str, dict[str, Any]]] = []
+        winning_label = _DEFAULT_SOURCE_LABEL
+        for label, state in source_states:
+            value, found = _normalized_state_lookup(state, keys, case_sensitive)
+            if not found:
+                continue
+            if winning_label == _DEFAULT_SOURCE_LABEL:
+                winning_label = label
+            mapping = _as_source_mapping(value)
+            if mapping is not None:
+                nested_states.append((label, mapping))
+
+        value = getattr(model, field_name)
+        is_nested_model = (
+            isinstance(value, BaseModel) and not value.__pydantic_root_model__
+        ) or is_pydantic_dataclass(type(value))
+        if is_nested_model:
+            # A source supplied the whole nested object rather than a partial mapping: every
+            # leaf then inherits that source.
+            if not nested_states and winning_label != _DEFAULT_SOURCE_LABEL:
+                full_mapping = _as_source_mapping(value)
+                nested_states = [(winning_label, full_mapping if full_mapping is not None else {})]
+            _collect_field_sources(type(value), value, f'{path}.', nested_states, case_sensitive, result)
+        else:
+            result[path] = winning_label
 
 
 def _strip_unset_defaults(value: Any, default: Any, default_obj: BaseModel) -> Any:
