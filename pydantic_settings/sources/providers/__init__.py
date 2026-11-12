@@ -4,6 +4,7 @@ from .aws import AWSSecretsManagerSettingsSource, AWSSystemsManagerSettingsSourc
 from .azure import AzureKeyVaultSettingsSource
 from .cli import (
     CliDualFlag,
+    CliExclude,
     CliExplicitFlag,
     CliImplicitFlag,
     CliMutuallyExclusiveGroup,
@@ -28,6 +29,7 @@ __all__ = [
     'AWSSystemsManagerSettingsSource',
     'AzureKeyVaultSettingsSource',
     'CliDualFlag',
+    'CliExclude',
     'CliExplicitFlag',
     'CliImplicitFlag',
     'CliMutuallyExclusiveGroup',

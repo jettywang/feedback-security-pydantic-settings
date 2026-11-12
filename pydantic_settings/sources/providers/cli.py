@@ -55,6 +55,7 @@ from ..types import (
     NoDecode,
     PydanticModel,
     _CliDualFlag,
+    _CliExclude,
     _CliExplicitFlag,
     _CliImplicitFlag,
     _CliPositionalArg,
@@ -360,6 +361,7 @@ CliToggleFlag = Annotated[_CliBoolFlag, _CliToggleFlag]
 CliDualFlag = Annotated[_CliBoolFlag, _CliDualFlag]
 CLI_SUPPRESS = SUPPRESS
 CliSuppress = Annotated[T, CLI_SUPPRESS]
+CliExclude = Annotated[T, _CliExclude]
 CliUnknownArgs = Annotated[list[str], Field(default=[]), _CliUnknownArgs, NoDecode]
 
 
@@ -905,6 +907,10 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
         positional_args, subcommand_args, optional_args = [], [], []
         validate_by_alias = _validate_by_alias_enabled(_get_model_config(model))
         for field_name, field_info in _get_model_fields(model).items():
+            if _CliExclude in field_info.metadata:
+                # Excluded fields are not registered as CLI arguments at all, so neither their
+                # long names, aliases, shortcuts, nor subcommand paths appear in help or accept values.
+                continue
             if _CliSubCommand in field_info.metadata:
                 if not field_info.is_required():
                     raise SettingsError(f'subcommand argument {model.__name__}.{field_name} has a default value')
@@ -1821,6 +1827,9 @@ class CliSettingsSource(EnvSettingsSource, Generic[T]):
         subcommand_args: list[str] = []
         unknown_args: list[str] = []
         for field_name, field_info in _get_model_fields(type(model) if _is_submodel else self.settings_cls).items():
+            if _CliExclude in field_info.metadata:
+                # Excluded fields have no parser entry and cannot be parsed back, so do not serialize them.
+                continue
             model_default = getattr(model, field_name)
             if field_info.default == model_default:
                 continue

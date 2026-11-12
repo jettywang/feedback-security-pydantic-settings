@@ -65,6 +65,7 @@ from pydantic_settings import (
 from pydantic_settings.sources import (
     CLI_SUPPRESS,
     CliDualFlag,
+    CliExclude,
     CliExplicitFlag,
     CliImplicitFlag,
     CliMutuallyExclusiveGroup,
@@ -3991,6 +3992,84 @@ visible_obj options:
                         (required)
 """
         )
+
+
+def test_cli_exclude(capsys, monkeypatch, env):
+    class SubCmd(BaseModel):
+        token: CliExclude[str] = 'sub-default'
+        sub_val: int = 0
+
+    class Settings(
+        BaseSettings,
+        cli_parse_args=True,
+        cli_prog_name='example.py',
+        cli_shortcuts={'api_key': 'ak', 'retries': 'r'},
+    ):
+        api_key: CliExclude[str] = Field(default='default-key', validation_alias=AliasChoices('api_key', 'k'))
+        retries: int = 3
+        sub: CliSubCommand[SubCmd]
+
+    # Excluded field is absent from root help; adjacent field is present with its shortcut.
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py', '--help'])
+        with pytest.raises(SystemExit):
+            Settings()
+        root_help = capsys.readouterr().out
+        assert 'api_key' not in root_help
+        assert '-k' not in root_help
+        assert '--ak' not in root_help
+        assert '--retries' in root_help
+        assert '-r' in root_help
+
+    # Excluded field is absent from subcommand help as well.
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py', 'sub', '--help'])
+        with pytest.raises(SystemExit):
+            Settings()
+        sub_help = capsys.readouterr().out
+        assert 'token' not in sub_help
+        assert '--sub_val' in sub_help
+
+    # Excluded fields cannot be set through any of their CLI names.
+    for bad_args in (
+        ['--api_key', 'x'],
+        ['-k', 'x'],
+        ['--ak', 'x'],
+        ['sub', '--token', 'x'],
+    ):
+        with monkeypatch.context() as m:
+            m.setattr(sys, 'argv', ['example.py'] + bad_args)
+            with pytest.raises(SystemExit):
+                Settings()
+            assert 'error' in capsys.readouterr().err
+
+    # Excluded fields still load from other sources (external credential injection).
+    env.set('api_key', 'injected-secret')
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py'])
+        settings = Settings()
+        assert settings.api_key == 'injected-secret'
+        # Adjacent field parsing and defaults are unaffected.
+        assert settings.retries == 3
+
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py', '--retries', '5'])
+        assert Settings().retries == 5
+
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py', '-r', '7'])
+        assert Settings().retries == 7
+
+    # Subcommand fields parse normally alongside the excluded one.
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py', 'sub', '--sub_val', '1'])
+        settings = Settings()
+        assert settings.sub == SubCmd(token='sub-default', sub_val=1)
+
+    # Serializing a model with a non-default excluded value neither emits it nor fails.
+    with monkeypatch.context() as m:
+        m.setattr(sys, 'argv', ['example.py'])
+        assert CliApp.serialize(Settings(api_key='changed', retries=9)) == ['--retries', '9']
 
 
 def test_cli_mutually_exclusive_group(capsys, monkeypatch):

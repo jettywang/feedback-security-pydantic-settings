@@ -2247,6 +2247,45 @@ options:
 """
 ```
 
+#### Excluding Fields from the CLI
+
+To exclude a field from the CLI entirely, the `CliExclude` annotation can be used for field types. Unlike
+`CliSuppress` (which only hides the help text), an excluded field is not registered as a command line argument at
+all: neither its long name, aliases, shortcuts, nor subcommand paths appear in the help text, and attempting to
+set a value through any of them is a parse error. The field still loads normally from the other configured
+sources (e.g. environment variables or secrets), which makes it suitable for sensitive values that must come
+from external credential injection rather than the process argument list.
+
+```py
+import sys
+
+from pydantic_settings import BaseSettings, CliExclude
+
+
+class Settings(BaseSettings, cli_parse_args=True):
+    """Exclude sensitive fields from the CLI."""
+
+    api_key: CliExclude[str] = 'default-key'
+    retries: int = 3
+
+
+try:
+    sys.argv = ['example.py', '--help']
+    Settings()
+except SystemExit as e:
+    print(e)
+    #> 0
+"""
+usage: example.py [-h] [--retries int]
+
+Exclude sensitive fields from the CLI.
+
+options:
+  -h, --help     show this help message and exit
+  --retries int  (default: 3)
+"""
+```
+
 #### CLI Shortcuts for Arguments
 
 Add alternative CLI argument names (shortcuts) for fields using the `cli_shortcuts` option in `SettingsConfigDict`. This allows you to define additional names for CLI arguments, which can be especially useful for providing more user-friendly or shorter aliases for deeply nested or verbose field names.

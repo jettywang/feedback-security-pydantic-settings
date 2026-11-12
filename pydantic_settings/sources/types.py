@@ -77,6 +77,10 @@ class _CliUnknownArgs:
     pass
 
 
+class _CliExclude:
+    pass
+
+
 class SecretVersion:
     def __init__(self, version: str) -> None:
         self.version = version
@@ -99,6 +103,7 @@ __all__ = [
     'PydanticModel',
     'SecretVersion',
     '_CliDualFlag',
+    '_CliExclude',
     '_CliExplicitFlag',
     '_CliImplicitFlag',
     '_CliPositionalArg',

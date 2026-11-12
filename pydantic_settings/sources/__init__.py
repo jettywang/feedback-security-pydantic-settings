@@ -13,6 +13,7 @@ from .providers.azure import AzureKeyVaultSettingsSource
 from .providers.cli import (
     CLI_SUPPRESS,
     CliDualFlag,
+    CliExclude,
     CliExplicitFlag,
     CliImplicitFlag,
     CliMutuallyExclusiveGroup,
@@ -54,6 +55,7 @@ __all__ = [
     'AWSSystemsManagerSettingsSource',
     'AzureKeyVaultSettingsSource',
     'CliDualFlag',
+    'CliExclude',
     'CliExplicitFlag',
     'CliImplicitFlag',
     'CliMutuallyExclusiveGroup',
